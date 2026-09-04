@@ -1,5 +1,6 @@
 package com.forge.storage;
 
+import com.forge.storage.compaction.Compactor;
 import com.forge.storage.memtable.MemTable;
 import com.forge.storage.memtable.StoredEntry;
 import com.forge.storage.sstable.SSTableReader;
@@ -28,6 +29,8 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 
@@ -102,14 +105,31 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
 
     private static final String WAL_FILE_NAME = "forge.wal";
     private static final String FLUSH_TEMP_FILE_NAME = "flush.tmp";
+    private static final String COMPACTION_TEMP_FILE_NAME = "compaction.tmp";
 
     /** An explicitly unbenchmarked placeholder default — see DESIGN.md on not fabricating tuned numbers. */
     private static final long DEFAULT_FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024;
 
+    /**
+     * Phase 13: once a flush leaves this many SSTables live, a full
+     * compaction runs synchronously (on the same thread that just
+     * completed the flush) before that write call returns — matching
+     * flush's own "off the lock, but still inline" pattern. An explicitly
+     * unbenchmarked placeholder default, same disclosure as
+     * {@link #DEFAULT_FLUSH_THRESHOLD_BYTES}.
+     */
+    private static final int DEFAULT_COMPACTION_TRIGGER_COUNT = 4;
+
     private final Path dataDirectory;
     private final long flushThresholdBytes;
+    private final int compactionTriggerCount;
     private final WriteAheadLog wal;
     private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
+
+    /** Guards against two compactions running at once; unrelated to {@link #stateLock}, which only ever needs to be held briefly. */
+    private final AtomicBoolean compactionInProgress = new AtomicBoolean(false);
+    /** Gives every compaction's output file a name no flush could ever produce — see {@code compactedSstableFileName}. */
+    private final AtomicLong compactionCounter = new AtomicLong();
 
     /**
      * Phase 9: notified with every record this store durably applies —
@@ -140,11 +160,28 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
     }
 
     public ConcurrentLsmKeyValueStore(Path dataDirectory, long flushThresholdBytes) throws IOException {
+        this(dataDirectory, flushThresholdBytes, DEFAULT_COMPACTION_TRIGGER_COUNT);
+    }
+
+    /**
+     * @param compactionTriggerCount SSTable count at which a full compaction
+     *                               is triggered after a flush; exposed
+     *                               mainly so tests can force compaction
+     *                               deterministically without needing to
+     *                               generate {@link #DEFAULT_COMPACTION_TRIGGER_COUNT}
+     *                               flushes' worth of data
+     */
+    public ConcurrentLsmKeyValueStore(Path dataDirectory, long flushThresholdBytes, int compactionTriggerCount)
+            throws IOException {
         this.dataDirectory = Objects.requireNonNull(dataDirectory, "dataDirectory must not be null");
         if (flushThresholdBytes <= 0) {
             throw new IllegalArgumentException("flushThresholdBytes must be positive");
         }
+        if (compactionTriggerCount < 2) {
+            throw new IllegalArgumentException("compactionTriggerCount must be at least 2");
+        }
         this.flushThresholdBytes = flushThresholdBytes;
+        this.compactionTriggerCount = compactionTriggerCount;
 
         Files.createDirectories(dataDirectory);
         List<SSTableReader> discovered = discoverSSTables(dataDirectory);
@@ -202,12 +239,19 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
             }
             active.put(key, value, seq);
             flushJob = maybeBeginFreezeLocked();
+            if (sstablesSnapshot != null) {
+                acquireAll(sstablesSnapshot);
+            }
         } finally {
             stateLock.writeLock().unlock();
         }
 
         if (sstablesSnapshot != null) {
-            previous = scanSstables(sstablesSnapshot, key);
+            try {
+                previous = scanSstables(sstablesSnapshot, key);
+            } finally {
+                releaseAll(sstablesSnapshot);
+            }
         }
         if (flushJob != null) {
             completeFlush(flushJob);
@@ -228,10 +272,15 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
                 return toValue(hit.get());
             }
             sstablesSnapshot = sstables;
+            acquireAll(sstablesSnapshot);
         } finally {
             stateLock.readLock().unlock();
         }
-        return scanSstables(sstablesSnapshot, key);
+        try {
+            return scanSstables(sstablesSnapshot, key);
+        } finally {
+            releaseAll(sstablesSnapshot);
+        }
     }
 
     @Override
@@ -260,12 +309,19 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
             }
             active.delete(key, seq);
             flushJob = maybeBeginFreezeLocked();
+            if (sstablesSnapshot != null) {
+                acquireAll(sstablesSnapshot);
+            }
         } finally {
             stateLock.writeLock().unlock();
         }
 
         if (sstablesSnapshot != null) {
-            previous = scanSstables(sstablesSnapshot, key);
+            try {
+                previous = scanSstables(sstablesSnapshot, key);
+            } finally {
+                releaseAll(sstablesSnapshot);
+            }
         }
         if (flushJob != null) {
             completeFlush(flushJob);
@@ -511,24 +567,41 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
                 collectLiveKeys(frozen.entries(), seen, liveKeys);
             }
             sstablesSnapshot = sstables;
+            acquireAll(sstablesSnapshot);
         } finally {
             stateLock.readLock().unlock();
         }
 
-        for (SSTableReader reader : sstablesSnapshot) {
-            List<Map.Entry<String, StoredEntry>> records;
-            try {
-                records = reader.scanAll();
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
-            for (Map.Entry<String, StoredEntry> entry : records) {
-                if (seen.add(entry.getKey()) && entry.getValue() instanceof StoredEntry.Value) {
-                    liveKeys.add(entry.getKey());
+        try {
+            for (SSTableReader reader : sstablesSnapshot) {
+                List<Map.Entry<String, StoredEntry>> records;
+                try {
+                    records = reader.scanAll();
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+                for (Map.Entry<String, StoredEntry> entry : records) {
+                    if (seen.add(entry.getKey()) && entry.getValue() instanceof StoredEntry.Value) {
+                        liveKeys.add(entry.getKey());
+                    }
                 }
             }
+        } finally {
+            releaseAll(sstablesSnapshot);
         }
         return liveKeys;
+    }
+
+    private static void acquireAll(List<SSTableReader> readers) {
+        for (SSTableReader reader : readers) {
+            reader.acquire();
+        }
+    }
+
+    private static void releaseAll(List<SSTableReader> readers) {
+        for (SSTableReader reader : readers) {
+            reader.release();
+        }
     }
 
     private static void collectLiveKeys(Map<String, StoredEntry> generation, Set<String> seen, Set<String> liveKeys) {
@@ -583,6 +656,7 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
      * flush crash-safe and never blocks concurrent readers/writers on disk I/O.
      */
     private void completeFlush(FlushJob job) {
+        int sstableCountAfterFlush;
         try {
             Path tempFile = dataDirectory.resolve(FLUSH_TEMP_FILE_NAME);
             Path finalFile = dataDirectory.resolve(sstableFileName(job.watermark()));
@@ -597,6 +671,7 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
                 updated.add(newReader);
                 updated.addAll(sstables);
                 sstables = List.copyOf(updated);
+                sstableCountAfterFlush = sstables.size();
                 frozen = null;
             } finally {
                 stateLock.writeLock().unlock();
@@ -608,6 +683,141 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
             // until restarted, but no data is at risk: active/frozen/WAL remain fully
             // consistent, and a fresh restart's recovery can flush again from scratch.
             throw new UncheckedIOException(e);
+        }
+
+        if (sstableCountAfterFlush >= compactionTriggerCount && compactionInProgress.compareAndSet(false, true)) {
+            try {
+                compactNow();
+            } finally {
+                compactionInProgress.set(false);
+            }
+        }
+    }
+
+    /**
+     * Phase 13: merges every currently-live SSTable into one. Runs
+     * synchronously on the calling thread (the thread that just completed a
+     * flush) — same "inline but off {@link #stateLock} for the slow part"
+     * shape as {@link #completeFlush} itself. Only ever entered with
+     * {@link #compactionInProgress} already held, so at most one compaction
+     * runs at a time; {@code stateLock} still separately protects
+     * {@link #sstables} against concurrent readers/writers, exactly as it
+     * does for a flush.
+     *
+     * <p>Because this always compacts <em>every</em> live table, it is
+     * always safe to drop tombstones with no surviving older generation
+     * left to shadow — see {@link Compactor}'s Javadoc.
+     *
+     * <p>The merge/read phase ({@link Compactor#compact}, which calls
+     * {@link SSTableReader#scanAll()} on each input) runs lock-free, on a
+     * snapshot acquired the same way {@link #get} protects its own
+     * lock-free scan: {@code acquire()} each input reader while still
+     * holding {@code stateLock}'s read lock, then {@code release()} them
+     * once the merge is done. Only the final swap — installing the merged
+     * reader (if any) and retiring the compacted-away inputs — takes the
+     * write lock, briefly.
+     *
+     * <p>A flush can complete concurrently with this method's lock-free
+     * merge phase (nothing stops it — flushes are never blocked on
+     * compaction). Any such newly-added reader appears at the <em>front</em>
+     * of {@code sstables} by the time the swap runs (flushes always
+     * prepend), so the swap identifies exactly which prefix of the current
+     * list is "new since this compaction's snapshot was taken" and keeps
+     * it untouched, replacing only the (still-contiguous, still
+     * same-relative-order) suffix this compaction actually read.
+     */
+    private void compactNow() {
+        List<SSTableReader> snapshot;
+        stateLock.readLock().lock();
+        try {
+            snapshot = sstables;
+            acquireAll(snapshot);
+        } finally {
+            stateLock.readLock().unlock();
+        }
+
+        Optional<Path> writtenFile;
+        try {
+            Path tempFile = dataDirectory.resolve(COMPACTION_TEMP_FILE_NAME);
+            Path finalFile = dataDirectory.resolve(compactedSstableFileName());
+            try {
+                writtenFile = Compactor.compact(snapshot, tempFile, finalFile, true);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        } finally {
+            releaseAll(snapshot);
+        }
+
+        SSTableReader mergedReader = null;
+        boolean swapped = false;
+        try {
+            if (writtenFile.isPresent()) {
+                mergedReader = SSTableReader.open(writtenFile.get());
+            }
+
+            stateLock.writeLock().lock();
+            try {
+                List<SSTableReader> current = sstables;
+                int newlyAddedCount = current.size() - snapshot.size();
+                List<SSTableReader> newlyAdded = current.subList(0, newlyAddedCount);
+
+                List<SSTableReader> updated = new ArrayList<>(newlyAdded.size() + 1);
+                updated.addAll(newlyAdded);
+                if (mergedReader != null) {
+                    updated.add(mergedReader);
+                }
+                sstables = List.copyOf(updated);
+            } finally {
+                stateLock.writeLock().unlock();
+            }
+            swapped = true;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        } finally {
+            // Old inputs are only ever retired (closed + deleted) once the swap
+            // above has actually published their replacement (or published the
+            // legitimate "nothing survived" empty state) into `sstables` — never
+            // on a failure path. Retiring them on a failed swap would delete the
+            // only copy of data that a broken or unopenable merged file was
+            // supposed to replace; this ordering is the one genuine correctness
+            // requirement compaction adds beyond what flush already guarantees.
+            if (swapped) {
+                for (SSTableReader oldReader : snapshot) {
+                    oldReader.retire();
+                }
+            } else if (mergedReader != null) {
+                // Opened successfully but the swap never completed — never
+                // published, so retire it here to avoid leaking the file; the
+                // old inputs are untouched and remain the live, correct data.
+                mergedReader.retire();
+            }
+        }
+    }
+
+    private String compactedSstableFileName() {
+        // "-c" never appears in a flush-produced name (see `sstableFileName`),
+        // so a compacted output's filename can never collide with one, and a
+        // flush and a compaction can never race to create the same path.
+        return String.format("sstable-c%019d-%d.sst", System.currentTimeMillis(), compactionCounter.incrementAndGet());
+    }
+
+    /**
+     * Explicitly triggers a full compaction, bypassing the SSTable-count
+     * threshold, so tests can force one deterministically. A no-op if a
+     * compaction is already in progress or there are fewer than two
+     * SSTables (nothing meaningful to merge).
+     */
+    public void compact() {
+        if (sstables.size() < 2) {
+            return;
+        }
+        if (compactionInProgress.compareAndSet(false, true)) {
+            try {
+                compactNow();
+            } finally {
+                compactionInProgress.set(false);
+            }
         }
     }
 

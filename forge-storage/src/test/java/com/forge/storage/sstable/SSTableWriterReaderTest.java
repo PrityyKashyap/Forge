@@ -1,5 +1,6 @@
 package com.forge.storage.sstable;
 
+import com.forge.storage.bloom.BloomFilterFile;
 import com.forge.storage.memtable.MemTable;
 import com.forge.storage.memtable.StoredEntry;
 import org.junit.jupiter.api.Test;
@@ -342,5 +343,100 @@ class SSTableWriterReaderTest {
             raf.seek(offset);
             raf.write(b ^ 0xFF);
         }
+    }
+
+    // --- Phase 13: Bloom filter integration --------------------------------
+
+    @Test
+    void writeProducesABloomFilterSidecarNextToTheSSTable(@TempDir Path dir) throws IOException {
+        MemTable memTable = new MemTable();
+        memTable.put("a", bytes("1"), 1);
+        Path finalFile = dir.resolve("sstable-1.sst");
+        SSTableWriter.write(dir.resolve("flush.tmp"), finalFile, memTable.entries(), memTable.maxSequenceNumber());
+
+        assertTrue(Files.exists(BloomFilterFile.sidecarPathFor(finalFile)));
+    }
+
+    @Test
+    void writeOfAnEmptyMemTableWritesNoSidecar(@TempDir Path dir) throws IOException {
+        MemTable memTable = new MemTable();
+        Path finalFile = dir.resolve("sstable-0.sst");
+        SSTableWriter.write(dir.resolve("flush.tmp"), finalFile, memTable.entries(), memTable.maxSequenceNumber());
+
+        assertTrue(Files.notExists(BloomFilterFile.sidecarPathFor(finalFile)));
+        try (SSTableReader reader = SSTableReader.open(finalFile)) {
+            assertTrue(reader.get("anything").isEmpty());
+        }
+    }
+
+    /**
+     * The correctness-critical case: a Bloom filter must never cause a
+     * tombstone to be skipped, or {@code get()} would incorrectly report a
+     * deleted key as absent-from-this-table (causing callers like
+     * {@code ConcurrentLsmKeyValueStore} to keep scanning older SSTables and
+     * incorrectly resurrect a stale value the tombstone was supposed to
+     * shadow). See {@code SSTableWriter}'s Javadoc on why tombstone keys are
+     * added to the filter exactly like value keys.
+     */
+    @Test
+    void bloomFilterNeverCausesATombstoneToBeMissed(@TempDir Path dir) throws IOException {
+        MemTable memTable = new MemTable();
+        memTable.delete("deleted-key", 1);
+        Path finalFile = dir.resolve("sstable-1.sst");
+        SSTableWriter.write(dir.resolve("flush.tmp"), finalFile, memTable.entries(), memTable.maxSequenceNumber());
+
+        assertTrue(Files.exists(BloomFilterFile.sidecarPathFor(finalFile)), "a table with a tombstone still gets a filter");
+        try (SSTableReader reader = SSTableReader.open(finalFile)) {
+            Optional<StoredEntry> hit = reader.get("deleted-key");
+            assertTrue(hit.isPresent(), "the tombstone itself must still be found, not skipped");
+            assertInstanceOf(StoredEntry.Tombstone.class, hit.get());
+        }
+    }
+
+    @Test
+    void getStillWorksCorrectlyWhenTheSidecarIsMissingEntirely(@TempDir Path dir) throws IOException {
+        MemTable memTable = new MemTable();
+        memTable.put("a", bytes("1"), 1);
+        memTable.put("b", bytes("2"), 2);
+        Path finalFile = dir.resolve("sstable-2.sst");
+        SSTableWriter.write(dir.resolve("flush.tmp"), finalFile, memTable.entries(), memTable.maxSequenceNumber());
+        Files.delete(BloomFilterFile.sidecarPathFor(finalFile)); // simulate a pre-Phase-13 SSTable, or a failed sidecar write
+
+        try (SSTableReader reader = SSTableReader.open(finalFile)) {
+            assertArrayEquals(bytes("1"), assertInstanceOf(StoredEntry.Value.class, reader.get("a").orElseThrow()).bytes());
+            assertArrayEquals(bytes("2"), assertInstanceOf(StoredEntry.Value.class, reader.get("b").orElseThrow()).bytes());
+            assertTrue(reader.get("never-written").isEmpty());
+        }
+    }
+
+    @Test
+    void retireDropsRefCountAndDeletesTheFileWhenNoAcquireIsOutstanding(@TempDir Path dir) throws IOException {
+        MemTable memTable = new MemTable();
+        memTable.put("a", bytes("1"), 1);
+        Path finalFile = dir.resolve("sstable-1.sst");
+        SSTableWriter.write(dir.resolve("flush.tmp"), finalFile, memTable.entries(), memTable.maxSequenceNumber());
+
+        SSTableReader reader = SSTableReader.open(finalFile);
+        reader.retire();
+
+        assertTrue(Files.notExists(finalFile), "retire with no outstanding acquire() must delete the file immediately");
+        assertTrue(Files.notExists(BloomFilterFile.sidecarPathFor(finalFile)));
+    }
+
+    @Test
+    void retireDefersDeletionUntilTheLastAcquireIsReleased(@TempDir Path dir) throws IOException {
+        MemTable memTable = new MemTable();
+        memTable.put("a", bytes("1"), 1);
+        Path finalFile = dir.resolve("sstable-1.sst");
+        SSTableWriter.write(dir.resolve("flush.tmp"), finalFile, memTable.entries(), memTable.maxSequenceNumber());
+
+        SSTableReader reader = SSTableReader.open(finalFile);
+        reader.acquire();
+        reader.retire();
+        assertTrue(Files.exists(finalFile), "the file must survive while an acquire() is still outstanding");
+        assertArrayEquals(bytes("1"), assertInstanceOf(StoredEntry.Value.class, reader.get("a").orElseThrow()).bytes());
+
+        reader.release();
+        assertTrue(Files.notExists(finalFile), "the last release() after retire() must delete the file");
     }
 }

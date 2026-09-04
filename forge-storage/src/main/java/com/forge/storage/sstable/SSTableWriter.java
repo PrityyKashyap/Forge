@@ -1,6 +1,10 @@
 package com.forge.storage.sstable;
 
+import com.forge.storage.bloom.BloomFilter;
+import com.forge.storage.bloom.BloomFilterFile;
 import com.forge.storage.memtable.StoredEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -23,8 +27,25 @@ import java.util.zip.CRC32;
  * until the atomic rename succeeds. Any crash before that point leaves only
  * an orphaned, never-visible temp file — see DESIGN.md's Phase 3 crash
  * scenario (b).
+ *
+ * <p><b>Phase 13 addition</b>: also builds and writes a {@link BloomFilter}
+ * sidecar (via {@link BloomFilterFile}) covering every key in {@code entries}
+ * — values and tombstones alike, since {@code SSTableReader.get()} needs to
+ * find a tombstone just as reliably as a value (see {@code SSTableReader}'s
+ * Javadoc on why skipping a tombstone would incorrectly resurrect a stale
+ * value from an older SSTable). The sidecar is written only <em>after</em>
+ * the main SSTable file's atomic rename has already succeeded, and a
+ * failure writing it is logged and swallowed rather than propagated — an
+ * SSTable is valid and fully readable with no sidecar at all (just without
+ * the scan-skipping optimization), so a sidecar-write failure must never
+ * fail the flush/compaction that already durably succeeded.
  */
 public final class SSTableWriter {
+
+    private static final Logger log = LoggerFactory.getLogger(SSTableWriter.class);
+
+    /** An explicitly unbenchmarked placeholder default — see DESIGN.md on not fabricating tuned numbers. */
+    private static final double DEFAULT_BLOOM_FALSE_POSITIVE_RATE = 0.01;
 
     private SSTableWriter() {
     }
@@ -38,15 +59,27 @@ public final class SSTableWriter {
      */
     public static void write(Path tempFile, Path finalFile, SortedMap<String, StoredEntry> entries,
             long maxSequenceNumber) throws IOException {
+        BloomFilter filter = BloomFilter.sizedFor(Math.max(1, entries.size()), DEFAULT_BLOOM_FALSE_POSITIVE_RATE);
         try (FileChannel channel = FileChannel.open(tempFile,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
             writeHeader(channel, entries.size(), maxSequenceNumber);
             for (Map.Entry<String, StoredEntry> entry : entries.entrySet()) {
                 writeRecord(channel, entry.getKey(), entry.getValue());
+                filter.add(entry.getKey());
             }
             channel.force(true);
         }
         Files.move(tempFile, finalFile, StandardCopyOption.ATOMIC_MOVE);
+
+        if (!entries.isEmpty()) {
+            try {
+                Path bloomTemp = tempFile.resolveSibling(tempFile.getFileName().toString() + ".bloom");
+                BloomFilterFile.write(bloomTemp, BloomFilterFile.sidecarPathFor(finalFile), filter);
+            } catch (IOException e) {
+                log.warn("failed to write Bloom filter sidecar for {}; {} remains fully valid without it",
+                        finalFile, finalFile, e);
+            }
+        }
     }
 
     private static void writeHeader(FileChannel channel, int entryCount, long maxSequenceNumber) throws IOException {

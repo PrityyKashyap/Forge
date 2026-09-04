@@ -1,0 +1,12 @@
+experiment_id,description,timestamp,metric,value,unit
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378842Z,sstable_count_before_compaction,28.000000,files
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378851Z,sstable_count_after_compaction,1.000000,files
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378853Z,on_disk_data_bytes_before_compaction,66172.000000,bytes
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378854Z,on_disk_data_bytes_after_compaction,6574.000000,bytes
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378855Z,bloom_sidecar_bytes_before_compaction,1456.000000,bytes
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378856Z,bloom_sidecar_bytes_after_compaction,92.000000,bytes
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378857Z,logical_bytes_put,57000.000000,bytes
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378858Z,write_amplification_flush_to_disk,1.160912,ratio
+E16,Compaction read/write amplification,2026-09-04T16:57:02.378859Z,space_reclaimed_by_compaction,59598.000000,bytes
+E16,Compaction read/write amplification,2026-09-04T16:57:02.380270Z,miss_lookup_avg_latency_before_compaction,0.017428,ms
+E16,Compaction read/write amplification,2026-09-04T16:57:02.380445Z,miss_lookup_avg_latency_after_compaction,0.004631,ms

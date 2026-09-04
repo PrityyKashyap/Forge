@@ -1,12 +1,18 @@
 package com.forge.storage.sstable;
 
+import com.forge.storage.bloom.BloomFilter;
+import com.forge.storage.bloom.BloomFilterFile;
 import com.forge.storage.memtable.StoredEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
@@ -14,6 +20,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.CRC32;
 
 /**
@@ -35,17 +43,54 @@ import java.util.zip.CRC32;
  * a safe discard of something that was never promised. See DESIGN.md's
  * Phase 3 notes on why WAL corruption and SSTable corruption are handled
  * differently.
+ *
+ * <h2>Phase 13 additions</h2>
+ * <p><b>Bloom filter short-circuit</b>: if a sidecar filter loaded at
+ * {@link #open} says a key is definitely absent, {@link #get} returns empty
+ * without scanning the file at all. See {@link BloomFilter}'s Javadoc for
+ * why this can never produce a wrong answer, and {@link BloomFilterFile}'s
+ * for why a missing/corrupt sidecar just disables the optimization rather
+ * than failing.
+ *
+ * <p><b>Reference-counted retirement</b>, for compaction: unlike Phase 3-12,
+ * where an SSTable file was permanent for the life of the store, a
+ * compaction now needs to retire (close and delete) SSTables it has merged
+ * away <em>while the store stays live</em> — including while a concurrent
+ * {@code get()}/{@code keys()} call may already be mid-scan against one of
+ * them, having taken a snapshot of the (about to be superseded) list before
+ * releasing {@code stateLock}. {@link #acquire()}/{@link #release()} let a
+ * caller hold a reader open for the duration of such a lock-free scan;
+ * {@link #retire()} (called by whoever removes this reader from the store's
+ * live list, under the write lock) drops the reader's own baseline
+ * reference and only actually closes the channel and deletes the file once
+ * every acquired reference has also been released — immediately, if no scan
+ * was in flight, or whenever the last in-flight scan finishes, otherwise.
+ * This is unrelated to {@link #close()}, which remains the plain,
+ * unconditional shutdown path used when the whole store is closing (a
+ * pre-existing Phase 4 contract that already assumes the caller has
+ * quiesced other access first — unchanged by Phase 13, since store shutdown
+ * and mid-life compaction retirement are different lifecycles with
+ * different concurrency assumptions).
  */
 public final class SSTableReader implements Closeable {
 
+    private static final Logger log = LoggerFactory.getLogger(SSTableReader.class);
+
+    private final Path path;
     private final FileChannel channel;
     private final long maxSequenceNumber;
     private final long fileSize;
+    private final BloomFilter bloomFilter;
 
-    private SSTableReader(FileChannel channel, long maxSequenceNumber, long fileSize) {
+    private final AtomicInteger refCount = new AtomicInteger(1);
+    private final AtomicBoolean pendingRemoval = new AtomicBoolean(false);
+
+    private SSTableReader(Path path, FileChannel channel, long maxSequenceNumber, long fileSize, BloomFilter bloomFilter) {
+        this.path = path;
         this.channel = channel;
         this.maxSequenceNumber = maxSequenceNumber;
         this.fileSize = fileSize;
+        this.bloomFilter = bloomFilter;
     }
 
     public static SSTableReader open(Path file) throws IOException {
@@ -81,7 +126,8 @@ public final class SSTableReader implements Closeable {
                 throw new IOException("corrupt SSTable header (checksum mismatch): " + file);
             }
 
-            return new SSTableReader(channel, maxSequenceNumber, fileSize);
+            BloomFilter bloomFilter = BloomFilterFile.tryLoad(file).orElse(null);
+            return new SSTableReader(file, channel, maxSequenceNumber, fileSize, bloomFilter);
         } catch (IOException | RuntimeException e) {
             try {
                 channel.close();
@@ -96,9 +142,26 @@ public final class SSTableReader implements Closeable {
         return maxSequenceNumber;
     }
 
-    /** Scans the file for {@code key}, stopping early once a greater key is seen. */
+    /** This reader's underlying file path — used by compaction to size/retire it. */
+    public Path path() {
+        return path;
+    }
+
+    /** This file's current on-disk size in bytes, including its header — used to measure compaction's effect on disk usage. */
+    public long fileSizeBytes() {
+        return fileSize;
+    }
+
+    /**
+     * Scans the file for {@code key}, stopping early once a greater key is
+     * seen — or immediately, without touching the file at all, if this
+     * table's Bloom filter says {@code key} is definitely absent.
+     */
     public Optional<StoredEntry> get(String key) throws IOException {
         Objects.requireNonNull(key, "key must not be null");
+        if (bloomFilter != null && !bloomFilter.mightContain(key)) {
+            return Optional.empty();
+        }
 
         long pos = SSTableFormat.HEADER_LENGTH;
         while (pos < fileSize) {
@@ -200,6 +263,53 @@ public final class SSTableReader implements Closeable {
     @Override
     public void close() throws IOException {
         channel.close();
+    }
+
+    /**
+     * Holds this reader open for the duration of a lock-free scan taken from
+     * a snapshot of the store's live SSTable list. Must only be called while
+     * still holding the lock under which that snapshot was read — see this
+     * class's Javadoc.
+     */
+    public void acquire() {
+        refCount.incrementAndGet();
+    }
+
+    /** Pairs with a prior {@link #acquire()}. */
+    public void release() {
+        decrementAndMaybeCleanUp();
+    }
+
+    /**
+     * Drops this reader's own baseline reference (representing "still in the
+     * store's live list") — called exactly once, by whoever removes this
+     * reader from that list. Closes the channel and deletes the underlying
+     * SSTable file (and its Bloom sidecar, if any) once no {@link #acquire()}
+     * is still outstanding — immediately, if none is, or when the last one
+     * releases, otherwise. Deletion failures are logged, not thrown: a
+     * leaked, no-longer-referenced compacted-away file is undesirable but
+     * not a correctness problem, unlike failing the compaction that already
+     * durably completed by the time this runs.
+     */
+    public void retire() {
+        pendingRemoval.set(true);
+        decrementAndMaybeCleanUp();
+    }
+
+    private void decrementAndMaybeCleanUp() {
+        if (refCount.decrementAndGet() == 0 && pendingRemoval.get()) {
+            try {
+                channel.close();
+            } catch (IOException e) {
+                log.warn("failed to close retired SSTable channel: {}", path, e);
+            }
+            try {
+                Files.deleteIfExists(path);
+                Files.deleteIfExists(BloomFilterFile.sidecarPathFor(path));
+            } catch (IOException e) {
+                log.warn("failed to delete retired SSTable file: {}", path, e);
+            }
+        }
     }
 
     /** Unlike the WAL's equivalent helper, premature EOF here is always fatal — see the class Javadoc. */

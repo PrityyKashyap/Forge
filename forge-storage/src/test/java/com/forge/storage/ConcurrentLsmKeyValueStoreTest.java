@@ -1153,4 +1153,185 @@ class ConcurrentLsmKeyValueStoreTest {
             assertEquals(writeCount, store.keys().size());
         }
     }
+
+    // =====================================================================
+    // Phase 13: compaction
+    // =====================================================================
+
+    @Test
+    void compactionRunsAutomaticallyOnceSstableCountReachesTheTrigger(@TempDir Path dir) throws IOException {
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 3)) {
+            store.put("a", bytes("1"));
+            store.flush();
+            store.put("b", bytes("2"));
+            store.flush();
+            assertEquals(2, countSSTableFiles(dir), "below the trigger count, no compaction yet");
+
+            store.put("c", bytes("3"));
+            store.flush(); // this is the 3rd SSTable — crosses the trigger
+
+            assertEquals(1, countSSTableFiles(dir), "at the trigger count, all tables merge into one");
+            assertArrayEquals(bytes("1"), store.get("a").orElseThrow());
+            assertArrayEquals(bytes("2"), store.get("b").orElseThrow());
+            assertArrayEquals(bytes("3"), store.get("c").orElseThrow());
+        }
+    }
+
+    @Test
+    void explicitCompactIsANoOpWithFewerThanTwoSstables(@TempDir Path dir) throws IOException {
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 100)) {
+            store.compact(); // zero SSTables — must not throw
+            assertEquals(0, countSSTableFiles(dir));
+
+            store.put("a", bytes("1"));
+            store.flush();
+            store.compact(); // one SSTable — must not throw, and must not need to do anything
+            assertEquals(1, countSSTableFiles(dir));
+            assertArrayEquals(bytes("1"), store.get("a").orElseThrow());
+        }
+    }
+
+    @Test
+    void compactionKeepsTheNewestValueAcrossOverwrites(@TempDir Path dir) throws IOException {
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 100)) {
+            store.put("a", bytes("first"));
+            store.flush();
+            store.put("a", bytes("second"));
+            store.flush();
+            store.put("a", bytes("third"));
+            store.flush();
+            assertEquals(3, countSSTableFiles(dir));
+
+            store.compact();
+
+            assertEquals(1, countSSTableFiles(dir));
+            assertArrayEquals(bytes("third"), store.get("a").orElseThrow());
+        }
+    }
+
+    /**
+     * The correctness invariant unique to <em>full</em> compaction (see
+     * {@code Compactor}'s Javadoc): a tombstone with no older generation
+     * left behind it may be dropped entirely, not merely kept-but-shadowed.
+     * Verified two ways: the logical result ({@code get} correctly reports
+     * absent) and the physical one (the merged file's raw record scan no
+     * longer contains any record at all for the key, confirming it was
+     * actually dropped rather than coincidentally shadowed by something
+     * else).
+     */
+    @Test
+    void fullCompactionDropsTombstonesEntirely(@TempDir Path dir) throws IOException {
+        Path finalSstable;
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 100)) {
+            store.put("gone", bytes("value"));
+            store.flush();
+            store.delete("gone");
+            store.flush();
+            store.put("stays", bytes("kept"));
+            store.flush();
+
+            store.compact();
+
+            assertEquals(1, countSSTableFiles(dir));
+            assertTrue(store.get("gone").isEmpty());
+            assertArrayEquals(bytes("kept"), store.get("stays").orElseThrow());
+
+            finalSstable = onlySstableFile(dir);
+        }
+
+        try (com.forge.storage.sstable.SSTableReader reader = com.forge.storage.sstable.SSTableReader.open(finalSstable)) {
+            var records = reader.scanAll();
+            assertTrue(records.stream().noneMatch(e -> e.getKey().equals("gone")),
+                    "a dropped tombstone must leave no trace in the compacted file, not just an unreachable one");
+            assertEquals(1, records.size());
+        }
+    }
+
+    @Test
+    void reopeningAfterCompactionStillSeesTheCorrectData(@TempDir Path dir) throws IOException {
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 100)) {
+            for (int i = 0; i < 10; i++) {
+                store.put("k" + i, bytes("v" + i));
+                store.flush();
+            }
+            store.compact();
+            assertEquals(1, countSSTableFiles(dir));
+        }
+        try (ConcurrentLsmKeyValueStore reopened = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 100)) {
+            for (int i = 0; i < 10; i++) {
+                assertArrayEquals(bytes("v" + i), reopened.get("k" + i).orElseThrow());
+            }
+        }
+    }
+
+    /**
+     * The core new adversarial scenario Phase 13 introduces: readers must
+     * never observe an exception or an incorrect value while compaction is
+     * concurrently retiring (closing and deleting) the very SSTables those
+     * readers may already have snapshotted. Sustained, mixed writer +
+     * compactor + reader load, long enough that the old (pre-refcounting)
+     * design's race — closing a file out from under an in-flight lock-free
+     * scan — would have reliably surfaced as a {@code ClosedChannelException}
+     * or a deleted-file read failure.
+     */
+    @Test
+    @Timeout(30)
+    void concurrentReadsDuringSustainedCompactionNeverThrowAndAlwaysSeeACorrectValue(@TempDir Path dir)
+            throws Exception {
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, 512, 2)) {
+            int keyCount = 400;
+            AtomicInteger writerProgress = new AtomicInteger(0);
+            AtomicBoolean stop = new AtomicBoolean(false);
+
+            runConcurrently(1 + 3 + 1, index -> {
+                if (index == 0) {
+                    for (int i = 0; i < keyCount; i++) {
+                        store.put("k" + i, bytes("v" + i));
+                        if (i % 5 == 0) {
+                            store.flush();
+                        }
+                        writerProgress.set(i + 1);
+                    }
+                    stop.set(true);
+                } else if (index == 1 + 3) {
+                    while (!stop.get()) {
+                        store.compact();
+                    }
+                    store.compact();
+                } else {
+                    Random random = new Random(index);
+                    while (!stop.get()) {
+                        int written = writerProgress.get();
+                        if (written == 0) {
+                            continue;
+                        }
+                        int i = random.nextInt(written);
+                        Optional<byte[]> value = store.get("k" + i);
+                        assertTrue(value.isPresent(), "k" + i + " was already written and never deleted");
+                        assertArrayEquals(bytes("v" + i), value.get());
+                    }
+                }
+            });
+
+            for (int i = 0; i < keyCount; i++) {
+                assertArrayEquals(bytes("v" + i), store.get("k" + i).orElseThrow());
+            }
+        }
+    }
+
+    private static Path onlySstableFile(Path dir) throws IOException {
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "sstable-*.sst")) {
+            Path only = null;
+            for (Path path : stream) {
+                if (only != null) {
+                    throw new IllegalStateException("expected exactly one SSTable file in " + dir);
+                }
+                only = path;
+            }
+            if (only == null) {
+                throw new IllegalStateException("expected exactly one SSTable file in " + dir);
+            }
+            return only;
+        }
+    }
 }
