@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.forge</groupId>
+    <artifactId>forge</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>FORGE</name>
+    <description>A distributed key-value store, built from scratch as a learning project.</description>
+
+    <modules>
+        <module>forge-common</module>
+        <module>forge-storage</module>
+        <module>forge-server</module>
+        <module>forge-client</module>
+        <module>forge-cluster</module>
+        <module>forge-bench</module>
+        <module>tests</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <junit.version>5.12.2</junit.version>
+        <slf4j.version>2.0.17</slf4j.version>
+        <logback.version>1.5.18</logback.version>
+    </properties>
+
+    <!--
+      dependencyManagement pins WHICH VERSION a dependency resolves to if a
+      module declares it, without itself pulling the dependency into any
+      module. Each module still has to list a dependency in its own
+      <dependencies> to actually get it on its classpath - this section only
+      makes sure every module that does agrees on the same version.
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <!--
+              A BOM (Bill of Materials): importing it pins consistent,
+              mutually-compatible versions for every junit-jupiter-* artifact
+              at once, so individual modules never need their own JUnit
+              version numbers.
+            -->
+            <dependency>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slf4j.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-classic</artifactId>
+                <version>${logback.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.15.0</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.5.6</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
