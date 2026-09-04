@@ -50,14 +50,28 @@ public final class RaftCluster implements Closeable {
     private final RaftRpcServer rpcServer;
     private final Map<NodeId, NodeAddress> peerAddresses;
     private final Duration rpcTimeout;
+    private final Duration leaseDuration;
     private final ScheduledExecutorService scheduler;
     private final ExecutorService dispatchExecutor;
 
     public RaftCluster(NodeId selfId, Map<NodeId, NodeAddress> peerAddresses, int port, Clock clock,
             Duration electionTimeoutMin, Duration electionTimeoutMax, Duration heartbeatInterval,
             Duration tickInterval, Duration rpcTimeout, Random random) throws IOException {
+        // A lease no shorter than the minimum election timeout: long enough that
+        // ordinary heartbeat jitter never trips it, short enough that a genuinely
+        // partitioned-away leader self-fences well before some other node could
+        // legitimately have won a new election (which itself needs at least
+        // electionTimeoutMin to elapse first) — see RaftNode.hasRecentQuorumContact.
+        this(selfId, peerAddresses, port, clock, electionTimeoutMin, electionTimeoutMax, heartbeatInterval,
+                tickInterval, rpcTimeout, electionTimeoutMin, random);
+    }
+
+    public RaftCluster(NodeId selfId, Map<NodeId, NodeAddress> peerAddresses, int port, Clock clock,
+            Duration electionTimeoutMin, Duration electionTimeoutMax, Duration heartbeatInterval,
+            Duration tickInterval, Duration rpcTimeout, Duration leaseDuration, Random random) throws IOException {
         this.peerAddresses = Map.copyOf(Objects.requireNonNull(peerAddresses, "peerAddresses must not be null"));
         this.rpcTimeout = Objects.requireNonNull(rpcTimeout, "rpcTimeout must not be null");
+        this.leaseDuration = Objects.requireNonNull(leaseDuration, "leaseDuration must not be null");
         this.node = new RaftNode(selfId, this.peerAddresses.keySet(), clock, electionTimeoutMin, electionTimeoutMax,
                 heartbeatInterval, random);
         this.rpcServer = new RaftRpcServer(node, port);
@@ -77,6 +91,15 @@ public final class RaftCluster implements Closeable {
 
     public boolean isConfirmedLeader() {
         return node.isConfirmedLeader();
+    }
+
+    /**
+     * The Phase 15 fencing gate — see {@link RaftNode#canServeAuthoritatively}.
+     * {@code PartitionLeadership} calls this, not {@link #isConfirmedLeader()},
+     * to decide whether a write may proceed.
+     */
+    public boolean canServeAuthoritatively() {
+        return node.canServeAuthoritatively(leaseDuration);
     }
 
     public java.util.Optional<NodeId> currentLeader() {

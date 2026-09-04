@@ -104,6 +104,14 @@ public final class RaftNode {
     private Instant lastHeartbeatSentTime;
     /** The log index of this term's own leader-announcement no-op — see {@link #isConfirmedLeader()}. */
     private long leaderNoOpIndex = -1;
+    /**
+     * Phase 15: when each peer last successfully acknowledged an
+     * AppendEntries in the <em>current</em> term — the raw material for
+     * {@link #hasRecentQuorumContact}, a leader-lease check distinct from
+     * {@link #isConfirmedLeader()}. Reset empty on every election (a stale
+     * ack from a previous term must never count towards this term's lease).
+     */
+    private Map<NodeId, Instant> lastAckTime = Map.of();
 
     public RaftNode(NodeId selfId, Set<NodeId> peers, Clock clock, Duration electionTimeoutMin,
             Duration electionTimeoutMax, Duration heartbeatInterval, Random random) {
@@ -203,6 +211,7 @@ public final class RaftNode {
         }
         nextIndex = newNextIndex;
         matchIndex = newMatchIndex;
+        lastAckTime = new HashMap<>();
         lastHeartbeatSentTime = now;
         recomputeCommitIndex();
         return buildAppendEntriesForAllPeers();
@@ -365,11 +374,53 @@ public final class RaftNode {
         if (response.success()) {
             matchIndex.merge(from, sentUpTo, Math::max);
             nextIndex.put(from, sentUpTo + 1);
+            recordAck(from);
             recomputeCommitIndex();
         } else {
             long current = nextIndex.getOrDefault(from, 1L);
             nextIndex.put(from, Math.max(1, current - 1));
         }
+    }
+
+    private void recordAck(NodeId from) {
+        lastAckTime.put(from, clock.instant());
+    }
+
+    /**
+     * Phase 15's leader-lease check: true if a majority of the cluster
+     * (self, trivially, plus every peer whose most recent successful
+     * AppendEntries ack in <em>this</em> term is no older than
+     * {@code within}) has been in contact recently. This is a
+     * <b>different, stronger</b> question than {@link #isConfirmedLeader()},
+     * which only ever asks "did I win an election and get one no-op
+     * acknowledged at some point" — a leader that won its election and was
+     * then partitioned away from every peer stays {@link #isConfirmedLeader()}
+     * forever (nothing ever tells it a higher term exists), but
+     * {@code hasRecentQuorumContact} correctly goes false roughly
+     * {@code within} after the partition starts, since acks simply stop
+     * arriving. This is what actually closes the "old leader is alive but
+     * stale, and never hears about the new term" gap: self-fencing via lease
+     * expiry, not just reacting to an explicit higher-term message.
+     *
+     * <p>Purely a local, this-node's-own-clock computation (like every other
+     * timeout in this codebase) — no cross-node clock synchronization is
+     * assumed or required.
+     */
+    public synchronized boolean hasRecentQuorumContact(Duration within) {
+        if (role != RaftRole.LEADER) {
+            return false;
+        }
+        if (peers.isEmpty()) {
+            return true; // a sole node is trivially always in contact with itself
+        }
+        Instant now = clock.instant();
+        long recentPeers = peers.stream()
+                .map(lastAckTime::get)
+                .filter(Objects::nonNull)
+                .filter(ackTime -> Duration.between(ackTime, now).compareTo(within) <= 0)
+                .count();
+        long contactedCount = 1 + recentPeers; // self always counts
+        return contactedCount * 2 > peers.size() + 1;
     }
 
     /**
@@ -442,6 +493,20 @@ public final class RaftNode {
      */
     public synchronized boolean isConfirmedLeader() {
         return role == RaftRole.LEADER && commitIndex >= leaderNoOpIndex;
+    }
+
+    /**
+     * The actual fencing gate: {@link #isConfirmedLeader()} (won an election
+     * and had the no-op acknowledged at some point) <em>and</em>
+     * {@link #hasRecentQuorumContact} (still, right now, in contact with a
+     * majority). Both conditions are read from the same synchronized method
+     * so a caller gets one consistent snapshot rather than two calls that
+     * could straddle a state change. This — not {@link #isConfirmedLeader()}
+     * alone — is what {@code PartitionLeadership}/{@code WriteAuthority}
+     * actually gate data-plane writes on.
+     */
+    public synchronized boolean canServeAuthoritatively(Duration leaseDuration) {
+        return isConfirmedLeader() && hasRecentQuorumContact(leaseDuration);
     }
 
     public synchronized long currentTerm() {

@@ -1,6 +1,9 @@
 package com.forge.cluster;
 
+import com.forge.client.ForgeServerException;
+import com.forge.common.protocol.ProtocolConstants;
 import com.forge.server.ForgeServer;
+import com.forge.server.WriteAuthority;
 import com.forge.storage.ConcurrentLsmKeyValueStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -154,5 +157,92 @@ class PartitionedForgeClientTest {
                 pool.shutdown();
             }
         }
+    }
+
+    // =====================================================================
+    // Phase 15: ERROR_NOT_LEADER redirect
+    // =====================================================================
+
+    private static final class FixedWriteAuthority implements WriteAuthority {
+        private final boolean canWrite;
+        private final String leaderHint;
+
+        FixedWriteAuthority(boolean canWrite, String leaderHint) {
+            this.canWrite = canWrite;
+            this.leaderHint = leaderHint;
+        }
+
+        @Override
+        public boolean canAcceptWrites() {
+            return canWrite;
+        }
+
+        @Override
+        public long currentTerm() {
+            return 7;
+        }
+
+        @Override
+        public Optional<String> currentLeaderHint() {
+            return Optional.ofNullable(leaderHint);
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void notLeaderResponseRedirectsRetryToTheHintedLeader(@TempDir Path baseDir) throws Exception {
+        NodeId nodeX = new NodeId("x");
+        NodeId nodeY = new NodeId("y");
+        ConsistentHashRing ring = ConsistentHashRing.of(Set.of(nodeX, nodeY));
+        String key = "redirect-test-key";
+        NodeId owner = ring.ownerOf(key);
+        NodeId other = owner.equals(nodeX) ? nodeY : nodeX;
+
+        // Both nodes serve the same single logical partition here (a replica set), matching
+        // Phase 15's scope — see com.forge.cluster.leadership's package Javadoc.
+        try (ConcurrentLsmKeyValueStore storeOwner = new ConcurrentLsmKeyValueStore(baseDir.resolve(owner.value()));
+             ForgeServer serverOwner = new ForgeServer(storeOwner, k -> true,
+                     new FixedWriteAuthority(false, other.value()), 0);
+             ConcurrentLsmKeyValueStore storeOther = new ConcurrentLsmKeyValueStore(baseDir.resolve(other.value()));
+             ForgeServer serverOther = new ForgeServer(storeOther, k -> true, WriteAuthority.NONE, 0)) {
+
+            ClusterTopology topology = ClusterTopology.empty()
+                    .withNode(owner, new NodeAddress("localhost", serverOwner.port()))
+                    .withNode(other, new NodeAddress("localhost", serverOther.port()));
+            assertEquals(owner, topology.ownerOf(key), "sanity check: the ring's owner must not have changed");
+
+            try (PartitionedForgeClient client = new PartitionedForgeClient(topology)) {
+                client.put(key, bytes("v1"));
+
+                assertArrayEquals(bytes("v1"), storeOther.get(key).orElseThrow(),
+                        "the write must have actually landed on the redirected-to node");
+                assertTrue(storeOwner.get(key).isEmpty(), "the rejecting node must never have received the write");
+            }
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void noRedirectTargetSurfacesTheOriginalNotLeaderError(@TempDir Path baseDir) throws Exception {
+        NodeId solo = new NodeId("solo");
+        ConsistentHashRing ring = ConsistentHashRing.of(Set.of(solo));
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(baseDir.resolve("solo"));
+             ForgeServer server = new ForgeServer(store, k -> true, new FixedWriteAuthority(false, null), 0)) {
+
+            ClusterTopology topology = ClusterTopology.empty().withNode(solo, new NodeAddress("localhost", server.port()));
+            try (PartitionedForgeClient client = new PartitionedForgeClient(topology)) {
+                ForgeServerException e = assertThrows(ForgeServerException.class, () -> client.put("k", bytes("v")));
+                assertEquals(ProtocolConstants.ERROR_NOT_LEADER, e.errorCode());
+            }
+        }
+    }
+
+    @Test
+    void parseLeaderHintExtractsTheDocumentedFormat() {
+        assertEquals(Optional.of(new NodeId("node-b")),
+                PartitionedForgeClient.parseLeaderHint("NOT_LEADER term=5 leader=node-b"));
+        assertEquals(Optional.empty(), PartitionedForgeClient.parseLeaderHint("NOT_LEADER term=5 leader=none"));
+        assertEquals(Optional.empty(), PartitionedForgeClient.parseLeaderHint("some unrelated message"));
+        assertEquals(Optional.empty(), PartitionedForgeClient.parseLeaderHint(null));
     }
 }

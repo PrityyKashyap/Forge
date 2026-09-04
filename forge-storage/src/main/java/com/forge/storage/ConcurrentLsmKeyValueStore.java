@@ -389,6 +389,28 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
     }
 
     /**
+     * Phase 15: ratchets this store's next-sequence-number forward to at
+     * least {@code minimum}, never backward — a thin pass-through to
+     * {@link WriteAheadLog#ensureNextSequenceNumberAtLeast}, the same
+     * primitive Phase 3/10 already use to align a fresh store's numbering
+     * with a discovered SSTable watermark or a loaded snapshot. Phase 15's
+     * new use: a node becoming (or following) a Raft-confirmed leader for
+     * term {@code T} calls this with {@code T}'s sequence "band" start
+     * (see {@code com.forge.cluster.leadership.SequenceEpochs}) so that
+     * every write originated under a new term lives in a sequence range no
+     * earlier leader's term could ever have reached — the mechanism that
+     * makes cross-term sequence-number collisions impossible without
+     * changing {@link WalRecord}, the replication wire format, or
+     * {@link #applyReplicated}'s gap-detection logic at all. Safe to call
+     * concurrently with ordinary reads; see the class Javadoc's locking
+     * discussion — this only ever moves the WAL's own internal counter,
+     * never touches {@code active}/{@code frozen}/{@code sstables}.
+     */
+    public void ensureNextSequenceNumberAtLeast(long minimum) {
+        wal.ensureNextSequenceNumberAtLeast(minimum);
+    }
+
+    /**
      * Every record currently in this store's WAL — a pass-through to
      * {@link WriteAheadLog#currentRecords()}, added for the same
      * replication-catch-up reason. Does not include anything already

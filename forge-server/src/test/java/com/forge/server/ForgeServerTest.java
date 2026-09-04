@@ -312,4 +312,100 @@ class ForgeServerTest {
             assertEquals(ProtocolConstants.ERROR_NOT_OWNER, assertInstanceOf(Response.Error.class, deleteResponse).errorCode());
         }
     }
+
+    // =====================================================================
+    // Phase 15: WriteAuthority fencing
+    // =====================================================================
+
+    private static final class FixedWriteAuthority implements WriteAuthority {
+        private volatile boolean canWrite;
+        private volatile long term;
+        private volatile String leaderHint;
+
+        FixedWriteAuthority(boolean canWrite, long term, String leaderHint) {
+            this.canWrite = canWrite;
+            this.term = term;
+            this.leaderHint = leaderHint;
+        }
+
+        @Override
+        public boolean canAcceptWrites() {
+            return canWrite;
+        }
+
+        @Override
+        public long currentTerm() {
+            return term;
+        }
+
+        @Override
+        public java.util.Optional<String> currentLeaderHint() {
+            return java.util.Optional.ofNullable(leaderHint);
+        }
+    }
+
+    @Test
+    void writeAuthorityNoneAllowsWritesByDefault() throws IOException {
+        try (ForgeServer server = new ForgeServer(new InMemoryKeyValueStore(), key -> true, 0);
+             Socket socket = new Socket("localhost", server.port())) {
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+
+            FrameCodec.writeRequest(out, new Request.Put("k", bytes("v")));
+            assertEquals(new Response.OkAbsent(), FrameCodec.readResponse(in, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH));
+        }
+    }
+
+    @Test
+    void deniedWriteAuthorityRejectsPutAndDeleteButNotGet() throws IOException {
+        InMemoryKeyValueStore store = new InMemoryKeyValueStore();
+        store.put("existing", bytes("v0"));
+        FixedWriteAuthority authority = new FixedWriteAuthority(false, 5, "node-b");
+        try (ForgeServer server = new ForgeServer(store, key -> true, authority, 0);
+             Socket socket = new Socket("localhost", server.port())) {
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+
+            FrameCodec.writeRequest(out, new Request.Put("k", bytes("v")));
+            Response putResponse = FrameCodec.readResponse(in, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH);
+            Response.Error putError = assertInstanceOf(Response.Error.class, putResponse);
+            assertEquals(ProtocolConstants.ERROR_NOT_LEADER, putError.errorCode());
+            assertTrue(putError.message().contains("term=5"), "message: " + putError.message());
+            assertTrue(putError.message().contains("leader=node-b"), "message: " + putError.message());
+            assertTrue(store.get("k").isEmpty(), "a fenced PUT must never reach the store");
+
+            FrameCodec.writeRequest(out, new Request.Delete("existing"));
+            Response deleteResponse = FrameCodec.readResponse(in, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH);
+            assertEquals(ProtocolConstants.ERROR_NOT_LEADER, assertInstanceOf(Response.Error.class, deleteResponse).errorCode());
+            assertArrayEquals(bytes("v0"), store.get("existing").orElseThrow(), "a fenced DELETE must never reach the store");
+
+            // Reads are deliberately NOT fenced — see docs/CONSISTENCY.md.
+            FrameCodec.writeRequest(out, new Request.Get("existing"));
+            Response getResponse = FrameCodec.readResponse(in, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH);
+            assertArrayEquals(bytes("v0"), assertInstanceOf(Response.OkPresent.class, getResponse).value());
+        }
+    }
+
+    @Test
+    void writeAuthorityIsConsultedFreshOnEveryRequestNotOnlyAtConnectionSetup() throws IOException {
+        InMemoryKeyValueStore store = new InMemoryKeyValueStore();
+        FixedWriteAuthority authority = new FixedWriteAuthority(false, 1, null);
+        try (ForgeServer server = new ForgeServer(store, key -> true, authority, 0);
+             Socket socket = new Socket("localhost", server.port())) {
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+
+            FrameCodec.writeRequest(out, new Request.Put("k", bytes("v")));
+            assertEquals(ProtocolConstants.ERROR_NOT_LEADER,
+                    assertInstanceOf(Response.Error.class,
+                            FrameCodec.readResponse(in, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH)).errorCode());
+
+            // Leadership is (re)confirmed mid-connection — the very next write on the SAME
+            // connection must succeed, proving the check is per-request, not cached.
+            authority.canWrite = true;
+            FrameCodec.writeRequest(out, new Request.Put("k", bytes("v")));
+            assertEquals(new Response.OkAbsent(), FrameCodec.readResponse(in, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH));
+            assertArrayEquals(bytes("v"), store.get("k").orElseThrow());
+        }
+    }
 }

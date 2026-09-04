@@ -57,6 +57,7 @@ public final class ForgeServer implements Closeable {
 
     private final KeyValueStore store;
     private final Predicate<String> ownershipPredicate;
+    private final WriteAuthority writeAuthority;
     private final int maxFrameLength;
     private final int maxKeyLength;
     private final ServerSocket serverSocket;
@@ -91,8 +92,30 @@ public final class ForgeServer implements Closeable {
 
     public ForgeServer(KeyValueStore store, Predicate<String> ownershipPredicate, int port, int maxFrameLength,
             int maxKeyLength) throws IOException {
+        this(store, ownershipPredicate, WriteAuthority.NONE, port, maxFrameLength, maxKeyLength);
+    }
+
+    /**
+     * Phase 15 addition: {@code writeAuthority} lets a node reject (with
+     * {@code ERROR_NOT_LEADER}, never touching {@code store}) a PUT/DELETE
+     * it is not currently fenced-authorized to accept — see
+     * {@link WriteAuthority}'s Javadoc for exactly how this differs from
+     * {@code ownershipPredicate}. Purely additive: every earlier constructor
+     * delegates here with {@link WriteAuthority#NONE} (always allow), so a
+     * caller that never heard of consensus/fencing gets byte-for-byte the
+     * same behavior as before this parameter existed.
+     */
+    public ForgeServer(KeyValueStore store, Predicate<String> ownershipPredicate, WriteAuthority writeAuthority,
+            int port) throws IOException {
+        this(store, ownershipPredicate, writeAuthority, port, ProtocolConstants.DEFAULT_MAX_FRAME_LENGTH,
+                ProtocolConstants.DEFAULT_MAX_KEY_LENGTH);
+    }
+
+    public ForgeServer(KeyValueStore store, Predicate<String> ownershipPredicate, WriteAuthority writeAuthority,
+            int port, int maxFrameLength, int maxKeyLength) throws IOException {
         this.store = Objects.requireNonNull(store, "store must not be null");
         this.ownershipPredicate = Objects.requireNonNull(ownershipPredicate, "ownershipPredicate must not be null");
+        this.writeAuthority = Objects.requireNonNull(writeAuthority, "writeAuthority must not be null");
         if (maxFrameLength <= 0) {
             throw new IllegalArgumentException("maxFrameLength must be positive");
         }
@@ -135,7 +158,7 @@ public final class ForgeServer implements Closeable {
             activeConnections.add(socket);
             connectionExecutor.execute(() -> {
                 try {
-                    new ConnectionHandler(socket, store, ownershipPredicate, maxFrameLength, maxKeyLength).run();
+                    new ConnectionHandler(socket, store, ownershipPredicate, writeAuthority, maxFrameLength, maxKeyLength).run();
                 } finally {
                     activeConnections.remove(socket);
                     closeQuietly(socket);

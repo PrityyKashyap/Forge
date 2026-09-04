@@ -38,6 +38,14 @@ class RaftNodeTest {
         return new RaftNode(self, peers, clock, ELECTION_MIN, ELECTION_MAX, HEARTBEAT, new Random(seed));
     }
 
+    private static RaftAction.SendAppendEntries findAppendEntriesTo(List<RaftAction> actions, NodeId target) {
+        return actions.stream()
+                .filter(a -> a.to().equals(target))
+                .map(a -> (RaftAction.SendAppendEntries) a)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no SendAppendEntries action addressed to " + target));
+    }
+
     // =====================================================================
     // Scenario 1: an election with a majority of votes wins outright
     // =====================================================================
@@ -395,6 +403,96 @@ class RaftNodeTest {
         }
         assertTrue(observedGaps.size() >= 2,
                 "successive elections from one node must use varying timeouts, not a fixed interval — observed: " + observedGaps);
+    }
+
+    // =====================================================================
+    // Phase 15: the leader-lease fencing check (canServeAuthoritatively)
+    // =====================================================================
+
+    /**
+     * The exact scenario the Phase 15 mandate calls "the difficult case":
+     * a leader that is alive, was legitimately elected, and never receives
+     * any message revealing a higher term (because it's genuinely isolated,
+     * not because anyone told it so) must still stop considering itself
+     * authoritative once it can no longer prove it has a majority. This is
+     * precisely what {@code isConfirmedLeader()} alone cannot do — it never
+     * looks at the actual passage of time as evidence of a problem.
+     */
+    @Test
+    void phase15_isolatedLeaderLosesQuorumContactWithinLeaseEvenWithoutHearingAHigherTerm() {
+        MutableClock clock = new MutableClock(Instant.EPOCH);
+        NodeId self = new NodeId("n1");
+        NodeId peer1 = new NodeId("n2");
+        NodeId peer2 = new NodeId("n3");
+        Duration lease = ELECTION_MIN;
+        RaftNode node = newNode(self, Set.of(peer1, peer2), clock);
+
+        clock.advance(PAST_ELECTION_TIMEOUT);
+        node.tick();
+        List<RaftAction> afterVote = node.handleRequestVoteResponse(peer1, new RequestVoteResponse(node.currentTerm(), true));
+        RaftAction.SendAppendEntries hb = findAppendEntriesTo(afterVote, peer1);
+        node.handleAppendEntriesResponse(peer1, hb.request(), new AppendEntriesResponse(node.currentTerm(), true, 1));
+        assertTrue(node.isConfirmedLeader());
+        assertTrue(node.canServeAuthoritatively(lease), "just acked — well within the lease");
+
+        // The network partitions here: no further AppendEntries responses ever arrive,
+        // and no one ever tells this node about a higher term (it's isolated, not deposed).
+        clock.advance(lease.plusMillis(1));
+
+        assertTrue(node.isConfirmedLeader(),
+                "isConfirmedLeader() alone never looks at elapsed time — it stays true forever, which is exactly the gap");
+        assertFalse(node.canServeAuthoritatively(lease),
+                "canServeAuthoritatively must self-fence once the lease expires with no fresh quorum contact");
+    }
+
+    @Test
+    void phase15_leaderWithOngoingAcksRetainsQuorumContact() {
+        MutableClock clock = new MutableClock(Instant.EPOCH);
+        NodeId self = new NodeId("n1");
+        NodeId peer1 = new NodeId("n2");
+        NodeId peer2 = new NodeId("n3");
+        Duration lease = ELECTION_MIN;
+        RaftNode node = newNode(self, Set.of(peer1, peer2), clock);
+
+        clock.advance(PAST_ELECTION_TIMEOUT);
+        node.tick();
+        List<RaftAction> afterVote = node.handleRequestVoteResponse(peer1, new RequestVoteResponse(node.currentTerm(), true));
+        RaftAction.SendAppendEntries hb = findAppendEntriesTo(afterVote, peer1);
+        node.handleAppendEntriesResponse(peer1, hb.request(), new AppendEntriesResponse(node.currentTerm(), true, 1));
+
+        // Keep acking from peer1 well inside every lease window, repeatedly, well past
+        // what a single lease duration would allow if acks had stopped.
+        for (int i = 0; i < 5; i++) {
+            clock.advance(lease.minusMillis(10));
+            assertTrue(node.canServeAuthoritatively(lease), "iteration " + i);
+            AppendEntriesRequest sent = new AppendEntriesRequest(node.currentTerm(), self, 1, node.currentTerm(), List.of(), 1);
+            node.handleAppendEntriesResponse(peer1, sent, new AppendEntriesResponse(node.currentTerm(), true, 1));
+        }
+        assertTrue(node.canServeAuthoritatively(lease));
+    }
+
+    @Test
+    void phase15_soleNodeAlwaysHasQuorumContact() {
+        MutableClock clock = new MutableClock(Instant.EPOCH);
+        RaftNode node = newNode(new NodeId("n1"), Set.of(), clock);
+        clock.advance(PAST_ELECTION_TIMEOUT);
+        node.tick();
+        assertTrue(node.isLeader());
+
+        clock.advance(Duration.ofDays(1)); // arbitrarily far in the future
+        assertTrue(node.canServeAuthoritatively(ELECTION_MIN), "a sole node's majority (of one) is always itself");
+    }
+
+    @Test
+    void phase15_canServeAuthoritativelyIsFalseForNonLeaders() {
+        MutableClock clock = new MutableClock(Instant.EPOCH);
+        NodeId self = new NodeId("n1");
+        RaftNode follower = newNode(self, Set.of(new NodeId("n2")), clock);
+        assertFalse(follower.canServeAuthoritatively(ELECTION_MIN), "a plain follower is never authoritative");
+
+        clock.advance(PAST_ELECTION_TIMEOUT);
+        follower.tick(); // becomes CANDIDATE
+        assertFalse(follower.canServeAuthoritatively(ELECTION_MIN), "a candidate is never authoritative either");
     }
 
     @Test

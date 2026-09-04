@@ -1,6 +1,8 @@
 package com.forge.cluster;
 
 import com.forge.client.ForgeClient;
+import com.forge.client.ForgeServerException;
+import com.forge.common.protocol.ProtocolConstants;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -9,6 +11,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * A cluster-aware client: given a fixed {@link ClusterTopology}, routes each
@@ -47,9 +51,31 @@ import java.util.concurrent.ConcurrentHashMap;
  * key, that node's {@code ForgeServer} (if constructed with an ownership
  * predicate) rejects it with {@code ERROR_NOT_OWNER}, surfaced here as an
  * ordinary {@code ForgeServerException} — there is no automatic re-routing
- * or topology refresh in this phase. See PROGRESS.md's Phase 7 section.
+ * or topology refresh for ownership changes. See PROGRESS.md's Phase 7
+ * section.
+ *
+ * <h2>Phase 15: one automatic retry on {@code ERROR_NOT_LEADER}</h2>
+ * A PUT/DELETE (never a GET — {@code ERROR_NOT_LEADER} is only ever
+ * returned for a write, see {@code docs/CONSISTENCY.md} §5) rejected with
+ * {@code ERROR_NOT_LEADER} carries a documented {@code "...leader=<id>"}
+ * hint in its message (see {@code ConnectionHandler.notLeaderMessage}).
+ * If that hint names a node this client's topology actually knows the
+ * address of, and it isn't the same node that just rejected the request,
+ * this client retries the <em>exact same request</em> against that node
+ * exactly once (no chained redirects, to bound worst-case latency and
+ * avoid a routing loop against a stale/oscillating hint). This is safe to
+ * retry blindly: {@code ConnectionHandler} checks write authority
+ * <em>before</em> touching the store, so a rejected write provably never
+ * applied anywhere, and PUT/DELETE are themselves idempotent (a repeated
+ * PUT of the same key/value or a repeated DELETE of the same key produces
+ * the same end state) — see {@code docs/CONSISTENCY.md} §6 for the fuller
+ * argument, including the (pre-existing, not Phase-15-specific) case of a
+ * client-side timeout of unknown outcome. If no useful redirect target is
+ * available, the original {@code ForgeServerException} is thrown unchanged.
  */
 public final class PartitionedForgeClient implements Closeable {
+
+    private static final Pattern NOT_LEADER_HINT = Pattern.compile("leader=(\\S+)");
 
     private final ClusterTopology topology;
     private final Map<NodeId, ForgeClient> connections = new ConcurrentHashMap<>();
@@ -67,28 +93,69 @@ public final class PartitionedForgeClient implements Closeable {
     }
 
     public void put(String key, byte[] value) throws IOException {
-        ForgeClient connection = connectionFor(key);
-        synchronized (connection) {
+        withLeaderRedirect(key, connection -> {
             connection.put(key, value);
-        }
+            return null;
+        });
     }
 
     public Optional<byte[]> get(String key) throws IOException {
-        ForgeClient connection = connectionFor(key);
+        ForgeClient connection = connectionFor(topology.ownerOf(key));
         synchronized (connection) {
             return connection.get(key);
         }
     }
 
     public void delete(String key) throws IOException {
-        ForgeClient connection = connectionFor(key);
-        synchronized (connection) {
+        withLeaderRedirect(key, connection -> {
             connection.delete(key);
+            return null;
+        });
+    }
+
+    private interface ClientOp<T> {
+        T apply(ForgeClient connection) throws IOException;
+    }
+
+    private <T> T withLeaderRedirect(String key, ClientOp<T> op) throws IOException {
+        NodeId owner = topology.ownerOf(key);
+        ForgeClient connection = connectionFor(owner);
+        try {
+            synchronized (connection) {
+                return op.apply(connection);
+            }
+        } catch (ForgeServerException e) {
+            if (e.errorCode() != ProtocolConstants.ERROR_NOT_LEADER) {
+                throw e;
+            }
+            Optional<NodeId> hinted = parseLeaderHint(e.getMessage());
+            if (hinted.isEmpty() || hinted.get().equals(owner) || topology.addressOf(hinted.get()).isEmpty()) {
+                throw e; // no usable redirect target — surface the original rejection
+            }
+            ForgeClient redirected = connectionFor(hinted.get());
+            synchronized (redirected) {
+                return op.apply(redirected);
+            }
         }
     }
 
-    private ForgeClient connectionFor(String key) throws IOException {
-        NodeId owner = topology.ownerOf(key);
+    /** Parses the {@code "...leader=<id>"} hint from an {@code ERROR_NOT_LEADER} message — see {@code ConnectionHandler.notLeaderMessage}. */
+    static Optional<NodeId> parseLeaderHint(String message) {
+        if (message == null) {
+            return Optional.empty();
+        }
+        Matcher matcher = NOT_LEADER_HINT.matcher(message);
+        if (!matcher.find()) {
+            return Optional.empty();
+        }
+        String id = matcher.group(1);
+        if (id.equals("none")) {
+            return Optional.empty();
+        }
+        return Optional.of(new NodeId(id));
+    }
+
+    private ForgeClient connectionFor(NodeId owner) throws IOException {
         try {
             return connections.computeIfAbsent(owner, node -> {
                 NodeAddress address = topology.addressOf(node)

@@ -46,14 +46,16 @@ final class ConnectionHandler implements Runnable {
     private final Socket socket;
     private final KeyValueStore store;
     private final Predicate<String> ownershipPredicate;
+    private final WriteAuthority writeAuthority;
     private final int maxFrameLength;
     private final int maxKeyLength;
 
-    ConnectionHandler(Socket socket, KeyValueStore store, Predicate<String> ownershipPredicate, int maxFrameLength,
-            int maxKeyLength) {
+    ConnectionHandler(Socket socket, KeyValueStore store, Predicate<String> ownershipPredicate,
+            WriteAuthority writeAuthority, int maxFrameLength, int maxKeyLength) {
         this.socket = socket;
         this.store = store;
         this.ownershipPredicate = ownershipPredicate;
+        this.writeAuthority = writeAuthority;
         this.maxFrameLength = maxFrameLength;
         this.maxKeyLength = maxKeyLength;
     }
@@ -113,6 +115,16 @@ final class ConnectionHandler implements Runnable {
             // risk silently serving a possibly-wrong (or possibly-orphaned) answer.
             return new Response.Error(ProtocolConstants.ERROR_NOT_OWNER, "this node does not own key: " + key);
         }
+        boolean isWrite = request instanceof Request.Put || request instanceof Request.Delete;
+        if (isWrite && !writeAuthority.canAcceptWrites()) {
+            // Phase 15 fencing: reads are deliberately NOT gated here (see
+            // docs/CONSISTENCY.md §5 — this node may still serve a stale local GET),
+            // but a write is refused before it ever reaches the store, exactly like
+            // the ownership check above. The message's "term=.../leader=..." shape is
+            // a documented, machine-parseable convention (not part of the binary wire
+            // format) that PartitionedForgeClient's retry logic knows how to read.
+            return new Response.Error(ProtocolConstants.ERROR_NOT_LEADER, notLeaderMessage());
+        }
         try {
             return switch (request) {
                 case Request.Put put -> {
@@ -134,5 +146,18 @@ final class ConnectionHandler implements Runnable {
             log.error("unexpected error handling {}", request, e);
             return new Response.Error(ProtocolConstants.ERROR_INTERNAL_ERROR, String.valueOf(e.getMessage()));
         }
+    }
+
+    /**
+     * The documented {@code ERROR_NOT_LEADER} message convention:
+     * {@code "NOT_LEADER term=<n> leader=<hint|none>"}. Plain text, not part
+     * of the binary wire format ({@code Response.Error.message()} is already
+     * an arbitrary string) — a client that doesn't know this convention just
+     * sees a human-readable diagnostic; one that does (see
+     * {@code PartitionedForgeClient}) can parse it to redirect a retry.
+     */
+    private String notLeaderMessage() {
+        String leaderHint = writeAuthority.currentLeaderHint().orElse("none");
+        return "NOT_LEADER term=" + writeAuthority.currentTerm() + " leader=" + leaderHint;
     }
 }
