@@ -2,10 +2,12 @@
 
 ## Current state
 
-**Phase 14 complete (all 8 core phases done). Continuing to final
-hardening, observability, documentation, demo, and the final report per
-the master continue-through-completion directive — see "Next task" at the
-end of this file for exactly where to resume.**
+**All 8 core phases (7-14) complete, plus final hardening, observability,
+and the full final documentation set (README, ARCHITECTURE, DESIGN,
+BENCHMARKS, FAILURE_MODEL, CONSISTENCY, OPERATIONS, DEMO,
+INTERVIEW_GUIDE, RESUME). 445/445 tests passing. The master directive's
+required work is complete; see "Next task" below for what remains
+optional/future.**
 
 ## Completed work
 
@@ -2244,13 +2246,137 @@ BUILD SUCCESS
   `FaultInjectingTcpProxy`-based Raft partition test is a reasonable,
   narrowly-scoped follow-up.
 
+## Final hardening, observability, and documentation (complete, 2026-09-04)
+
+### Engineering audit
+
+Searched every module's `src/main` for: TODO/FIXME/XXX (none found);
+`System.out`/`System.err` prints outside intentional CLI/report output
+(none found — the only matches are `forge-bench`'s already-intentional
+human-readable summary printers, same precedent as `BenchmarkRunner`);
+`printStackTrace` (none — every exception path goes through SLF4J);
+`UnsupportedOperationException` (one match, in a test asserting an
+immutable view correctly throws — not a placeholder); empty/swallowed
+catch blocks (none, checked with an AST-agnostic but thorough line-based
+scan across every `src/main` file); "placeholder/dummy/fake/stub/mock" in
+production code (every match is a deliberate, documented, disclosed
+default like `DEFAULT_FLUSH_THRESHOLD_BYTES`'s own "explicitly
+unbenchmarked placeholder" comment, or a "fake Clock" reference describing
+the injectable-clock testing pattern — no actual placeholder logic).
+
+**One real defect found and fixed**: `forge-server`'s `pom.xml` had
+`logback-classic` scoped to `test` only — meaning `com.forge.server.Main`,
+run as a real standalone process (exactly what a demo or production
+deployment would do), would silently produce **zero log output** via
+SLF4J's no-op fallback logger. Invisible to every existing test, since
+Maven's test classpath already includes `logback-classic` regardless of
+main-scope declarations, so nothing before this audit ever ran `Main` the
+way a real deployment would. **Fixed** by moving `logback-classic` to a
+normal (compile/runtime) dependency and adding the `exec-maven-plugin`
+configuration `forge-bench` already had, so `mvn -pl forge-server
+exec:java` is now a real, working way to run a node — confirmed by
+actually starting one this way and observing its startup log line appear
+(previously it would not have). This directly unblocks `docs/DEMO.md` and
+`docs/OPERATIONS.md`, both of which depend on being able to see a running
+node's log output.
+
+**Two stale/incorrect claims found in `docs/DESIGN.md` §2 and corrected in
+place** (not silently deleted — each correction says what the original
+text claimed and why it no longer matches reality):
+1. The original plan described two selectable replication ack policies
+   (sync and async); only async was ever built. Sync replication does not
+   exist in this codebase.
+2. The original plan implied a deliberate, documented decision about
+   whether a catching-up follower serves reads before it's fully caught
+   up. No such gate was ever built — a follower simply serves whatever it
+   has at any moment, which is the emergent behavior of there being no
+   gate, not a chosen tradeoff.
+
+**One real, previously-unstated architectural gap found and disclosed**
+(not fixed — a genuine scope decision, not a bug): `docs/DESIGN.md` §2's
+consistency table implied fencing/epochs existed to prevent split-brain
+("this assumption breaks under split-brain... exactly why fencing matters
+in Phase 9-10"). No fencing or epoch mechanism exists anywhere in this
+codebase — `ForgeServer`'s partition-ownership predicate is a static
+value set at construction, never updated at runtime by Raft or anything
+else. This is now stated plainly in `docs/DESIGN.md`, `docs/CONSISTENCY.md`,
+`docs/FAILURE_MODEL.md`, the README, and the interview guide — an
+"Architectural Honesty Requirement" case where a document implied a
+guarantee the implementation doesn't actually provide.
+
+### Observability (Phase 14's "lightweight metrics/admin" requirement)
+
+Added `ConcurrentLsmKeyValueStore.status()` / `StoreStatus` (SSTable
+count, on-disk bytes, active MemTable size, flush-in-progress, next WAL
+sequence number) and a `forge-server status <dataDirectory>` CLI
+subcommand (`Main.java`) that opens a store offline and prints it.
+**Honestly scoped, not oversold**: this covers storage-engine metrics
+only. Cluster-level metrics (membership, partition ownership, Raft
+leader/term, replication lag) all exist as real Java accessors on live
+objects (`FailureDetector.snapshot()`, `RaftCluster.currentLeader()`,
+etc.) but are not exposed over the network for remote inspection of a
+running server — see `docs/OPERATIONS.md` for the complete, explicit
+table of what exists vs. what doesn't, and why a full HTTP admin endpoint
+wasn't built this phase (time budget, given Phases 7-14's core mechanisms
+were the priority).
+
+### Final documentation set
+
+- `README.md` — fully rewritten (was still describing "Phase 0 complete,
+  Phase 1 not started"); now covers architecture, every module, every
+  phase's mechanism, real benchmark highlights, exact how-to-run
+  instructions (verified working, not assumed), limitations, and future
+  work, in the 23-section shape the master directive specified.
+- `docs/ARCHITECTURE.md` — added §3.12 (consensus), corrected the
+  now-stale "defer Raft until needed" non-goal (struck through with an
+  explanation, not deleted), added the no-auth/no-TLS non-goal, updated
+  the repository structure diagram.
+- `docs/DESIGN.md` — two corrections recorded in place (see above).
+- `docs/FAILURE_MODEL.md`, `docs/CONSISTENCY.md`, `docs/OPERATIONS.md`,
+  `docs/DEMO.md`, `docs/INTERVIEW_GUIDE.md`, `docs/RESUME.md` — new,
+  written this phase.
+
+Every command documented in `README.md` and `docs/DEMO.md` was actually
+run against this repository while writing it, and its real output
+checked — including catching and fixing two commands that would not have
+worked as originally drafted (missing `-Dsurefire.failIfNoSpecifiedTests=false`
+and wrong module scoping for tests living outside the module Maven
+defaults to when run from the repo root).
+
+### Tests
+
+`mvn clean test` from the repo root — **445/445 tests pass, 0 failures, 0
+errors** (444 from Phase 14 + 1 new `ConcurrentLsmKeyValueStoreTest` case
+for `status()`):
+
+```
+forge-common  : 42   (unchanged)
+forge-storage : 257  (256 + 1 statusReflectsRealStorageEngineState)
+forge-server  : 15   (unchanged)
+forge-client  : 11   (unchanged)
+forge-cluster : 88   (unchanged)
+forge-bench   : 14   (unchanged)
+forge-tests   : 18   (unchanged)
+BUILD SUCCESS
+```
+
+### Known limitations carried forward (not introduced this phase)
+
+Every limitation named in this final-hardening pass was already known
+from its originating phase and is now additionally cross-referenced from
+the new documentation set — nothing new was discovered that isn't already
+recorded in that phase's own PROGRESS.md section. The one genuinely new
+finding this phase (the fencing/epoch gap) was a documentation accuracy
+issue, not a newly-introduced code defect — the gap itself has existed
+since Phase 9/10; what changed is that it's now honestly written down.
+
 ## Next task
 
-**Final hardening.** Not started. Continuing sequentially per the master
-directive: full engineering audit across every module (public APIs, thread
-safety, resource management, shutdown, exceptions, logging, config,
-serialization, protocol validation, persistence, corruption handling,
-recovery, cluster behavior); search for and document/resolve TODOs,
-FIXMEs, dead code, debug prints, hardcoded ports/paths, unsafe defaults,
-swallowed exceptions — then observability/operations, final documentation
-set, demo script, final testing pass, and the final report.
+**Optional final UI**: explicitly gated on the core being complete and
+undelayed by the master directive — deprioritized in favor of finishing
+the required final documentation, demo, and report on schedule; not
+attempted. **Final report**: see the message accompanying this session's
+completion for the full 21-item report the master directive specifies.
+This file (PROGRESS.md) and the documents listed in README §23 are the
+complete, current state of the project — there is no further "next task"
+pending from the master directive's phase list.

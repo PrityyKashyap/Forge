@@ -161,6 +161,18 @@ of these numbers. Full metric definitions, how each is computed, and which
 phase makes each one measurable for the first time live in
 [DESIGN.md §3](DESIGN.md#3-observable-metrics) — this exists here only so the
 component list above is honest that metrics aren't bolted on at the end.
+See also `docs/OPERATIONS.md` for the Phase-14-era admin/inspection surface.
+
+### 3.12 Consensus & automated failover (Phase 14)
+A real Raft implementation (`forge-cluster`'s `consensus` package) —
+terms, majority-vote leader election, AppendEntries log replication, and
+the paper's Figure 8 commit-safety rule — used as the **control plane**
+for deciding which node currently leads. Deliberately not a replacement
+for §3.8's replication: Raft's own log carries nothing but a one-entry-per-
+election marker, never real KV writes. See PROGRESS.md's Phase 14 section
+for the precise scope (no persistent Raft state; not yet wired into
+§3.8/§3.4's live runtime — the integration signal exists,
+`RaftCluster.isConfirmedLeader()`, but nothing consumes it yet).
 
 ## 4. Repository structure
 
@@ -172,22 +184,31 @@ project this size):
 forge/
 ├── pom.xml                      (parent/aggregator)
 ├── README.md
-├── PROGRESS.md
+├── PROGRESS.md                  (phase-by-phase log: decisions, bugs found/fixed, tests)
 ├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── DESIGN.md
-│   └── BENCHMARKS.md
+│   ├── ARCHITECTURE.md          (this file)
+│   ├── DESIGN.md                (roadmap, phase contracts, implementation constraints)
+│   ├── BENCHMARKS.md            (real, measured results only — §1-§8)
+│   ├── FAILURE_MODEL.md         (what FORGE assumes can fail, and how each phase responds)
+│   ├── CONSISTENCY.md           (exactly what a GET/PUT does and doesn't guarantee)
+│   ├── OPERATIONS.md            (how to inspect a running cluster's state)
+│   ├── DEMO.md                  (a reproducible, real-commands-only walkthrough)
+│   ├── INTERVIEW_GUIDE.md       (implementation-grounded Q&A)
+│   └── RESUME.md                (resume bullets, sourced from what's actually built/measured)
 ├── tests/                       (cross-module integration/system tests)
-├── forge-common/                (shared types: Key/Value, wire protocol messages,
+├── forge-common/                (shared types, wire protocol messages,
 │                                  serialization helpers — no logic of its own)
-├── forge-storage/                (MemTable, WAL, on-disk files, compaction,
-│                                  the GET/PUT/DELETE storage API)
+├── forge-storage/                (MemTable, WAL, SSTables, compaction, Bloom
+│                                  filters, the GET/PUT/DELETE storage API)
 ├── forge-server/                 (TCP server, connection handling, wraps
 │                                  forge-storage for a single node)
 ├── forge-client/                 (client library + CLI)
-├── forge-cluster/                (partition map, consistent hashing,
-│                                  membership, failure detection, replication)
-└── forge-bench/                  (load generator, latency/throughput measurement)
+├── forge-cluster/                (consistent hashing/partitioning, membership
+│                                  & failure detection, leader-follower
+│                                  replication, snapshot recovery, chaos/fault
+│                                  injection, Raft consensus)
+└── forge-bench/                  (load generators + latency/throughput/
+                                   amplification measurement, all results real)
 ```
 
 Each module has its own `src/main/java` and `src/test/java` with unit tests
@@ -210,6 +231,15 @@ spin up multiple modules/processes together (e.g. a 3-node cluster test).
 - Not implementing full Byzantine fault tolerance — the failure model is
   crash-stop (a node stops or is slow; it doesn't send malicious/corrupted
   data on purpose).
-- Not reaching for Raft/Paxos-style automated consensus until the simpler,
-  hand-built failover mechanism has been built, tested, and shown (via
-  chaos testing) to actually need replacing — see DESIGN.md §9.
+- **Update, Phase 14**: this non-goal originally deferred Raft/Paxos-style
+  consensus until simpler failover was shown to need replacing. That plan
+  was superseded by an explicit, later project directive to build real
+  consensus regardless, as the capstone distributed-systems phase — Phase
+  14 implements it (§3.12). Left here, struck through in spirit rather than
+  deleted, so the roadmap's own history stays honest rather than quietly
+  rewritten.
+- No authentication, authorization, or transport encryption (TLS) —
+  `ForgeServer` accepts any TCP connection and trusts every request. Adding
+  either is ordinary, well-understood engineering, not a distributed-systems
+  concept this project exists to explore; both are natural extensions if
+  FORGE were ever exposed beyond a trusted local/demo environment.

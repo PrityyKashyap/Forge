@@ -881,4 +881,34 @@ public final class ConcurrentLsmKeyValueStore implements KeyValueStore, Closeabl
     /** The MemTable being flushed, and the WAL watermark it represents. */
     private record FlushJob(MemTable memTableToFlush, long watermark) {
     }
+
+    /**
+     * A point-in-time snapshot of this store's own storage-engine metrics —
+     * the Phase 14 "final hardening" observability addition: real numbers
+     * this store already tracks internally, exposed for external inspection
+     * (see {@code docs/OPERATIONS.md}) rather than left only as private
+     * fields useful solely to this class's own logic.
+     */
+    public record StoreStatus(
+            int sstableCount,
+            long totalSstableBytes,
+            long activeMemTableSizeBytes,
+            boolean flushInProgress,
+            long lastAppliedSequenceNumber) {
+    }
+
+    /** See {@link StoreStatus}. Cheap: sums already-known file sizes, does not touch disk. */
+    public StoreStatus status() {
+        stateLock.readLock().lock();
+        try {
+            long totalSstableBytes = 0;
+            for (SSTableReader reader : sstables) {
+                totalSstableBytes += reader.fileSizeBytes();
+            }
+            return new StoreStatus(sstables.size(), totalSstableBytes, active.approximateSizeInBytes(),
+                    frozen != null, wal.nextSequenceNumber());
+        } finally {
+            stateLock.readLock().unlock();
+        }
+    }
 }

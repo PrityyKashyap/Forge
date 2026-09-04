@@ -36,6 +36,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1316,6 +1317,29 @@ class ConcurrentLsmKeyValueStoreTest {
             for (int i = 0; i < keyCount; i++) {
                 assertArrayEquals(bytes("v" + i), store.get("k" + i).orElseThrow());
             }
+        }
+    }
+
+    @Test
+    void statusReflectsRealStorageEngineState(@TempDir Path dir) throws IOException {
+        try (ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dir, Long.MAX_VALUE, 100)) {
+            ConcurrentLsmKeyValueStore.StoreStatus empty = store.status();
+            assertEquals(0, empty.sstableCount());
+            assertEquals(0, empty.totalSstableBytes());
+            assertEquals(0, empty.activeMemTableSizeBytes());
+            assertFalse(empty.flushInProgress());
+            assertEquals(1, empty.lastAppliedSequenceNumber());
+
+            store.put("a", bytes("1"));
+            ConcurrentLsmKeyValueStore.StoreStatus afterPut = store.status();
+            assertTrue(afterPut.activeMemTableSizeBytes() > 0);
+            assertEquals(2, afterPut.lastAppliedSequenceNumber());
+
+            store.flush();
+            ConcurrentLsmKeyValueStore.StoreStatus afterFlush = store.status();
+            assertEquals(1, afterFlush.sstableCount());
+            assertTrue(afterFlush.totalSstableBytes() > 0);
+            assertEquals(0, afterFlush.activeMemTableSizeBytes(), "a fresh active MemTable after flush is empty");
         }
     }
 
