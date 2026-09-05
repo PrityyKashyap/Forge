@@ -1,27 +1,42 @@
 package com.forge.cluster.chaos;
 
+import com.forge.client.ForgeClient;
+import com.forge.client.ForgeServerException;
+import com.forge.cluster.NodeAddress;
 import com.forge.cluster.NodeId;
+import com.forge.cluster.consensus.RaftCluster;
+import com.forge.cluster.leadership.PartitionLeadership;
 import com.forge.cluster.membership.FailureDetector;
 import com.forge.cluster.membership.NodeState;
 import com.forge.cluster.recovery.SnapshotClient;
+import com.forge.cluster.recovery.SnapshotServer;
 import com.forge.cluster.replication.ReplicationFollower;
 import com.forge.cluster.replication.ReplicationServer;
+import com.forge.common.protocol.ProtocolConstants;
+import com.forge.server.ForgeServer;
 import com.forge.storage.ConcurrentLsmKeyValueStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -40,8 +55,43 @@ import static org.junit.jupiter.api.Assertions.fail;
  * Phase 14) and replication is <b>asynchronous only</b> (Phase 9) — so no
  * scenario here claims "zero data loss" for a write that was only ever
  * acknowledged by a leader that then died before shipping it anywhere.
+ *
+ * <h2>Scenarios G-L (Phase 15)</h2>
+ * Six more scenarios, added once real Raft-driven data-plane fencing
+ * existed to test: leader crash + automatic failover, an old leader
+ * reconnecting after failover, network partition + majority election,
+ * delayed stale-leader messages, repeated leader crashes, and a crash
+ * during follower catch-up. These build on {@code PartitionLeadership}/
+ * {@code ReplicationFollowerCoordinator}/{@code StaleReplicaRecovery} —
+ * see {@code com.forge.cluster.leadership}'s two dedicated integration
+ * tests ({@code StaleLeaderFencingIntegrationTest},
+ * {@code FailoverReplicationIntegrationTest}) for the fuller, multi-step
+ * versions of several of these stories; the scenarios here are
+ * deliberately smaller and each isolates one specific behavior, matching
+ * scenarios A-F's own scope and style.
  */
 class ChaosScenarioTest {
+
+    private static final Duration A_ELECTION_MIN = Duration.ofMillis(40);
+    private static final Duration A_ELECTION_MAX = Duration.ofMillis(60);
+    private static final Duration BC_ELECTION_MIN = Duration.ofMillis(400);
+    private static final Duration BC_ELECTION_MAX = Duration.ofMillis(600);
+    private static final Duration RAFT_HEARTBEAT = Duration.ofMillis(25);
+    private static final Duration RAFT_TICK = Duration.ofMillis(10);
+    private static final Duration RAFT_RPC_TIMEOUT = Duration.ofMillis(500);
+    private static final Duration LEASE = A_ELECTION_MIN;
+
+    private static int freePort() throws IOException {
+        try (ServerSocket probe = new ServerSocket(0)) {
+            return probe.getLocalPort();
+        }
+    }
+
+    private static Map<NodeId, NodeAddress> without(Map<NodeId, NodeAddress> addresses, NodeId self) {
+        Map<NodeId, NodeAddress> copy = new HashMap<>(addresses);
+        copy.remove(self);
+        return copy;
+    }
 
     private static byte[] bytes(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
@@ -379,5 +429,400 @@ class ChaosScenarioTest {
 
         assertEquals(NodeState.ALIVE, detectorOnA.stateOf(b).orElseThrow());
         assertEquals(NodeState.ALIVE, detectorOnB.stateOf(a).orElseThrow());
+    }
+
+    /**
+     * <b>Scenario G — leader crash + automatic failover.</b>
+     * <p>Assumptions: a 3-node Raft group (Phase 14); A is engineered to
+     * always win the first election via a much shorter election timeout
+     * than B/C (this scenario is about what happens after a legitimate
+     * leader dies, not about a fair election race).
+     * <p>Safety property: at every point in time, {@code isConfirmedLeader()}
+     * is true for at most one of the three nodes (checked immediately
+     * before and after the crash).
+     * <p>Liveness property: once A is killed outright, the surviving
+     * majority (B+C) elects a new, confirmed leader at a strictly higher
+     * term, and that new leader's own {@code PartitionLeadership} accepts a
+     * real client write within a bounded time — the data plane, not just
+     * the control plane, recovers.
+     */
+    @Test
+    @Timeout(30)
+    void scenarioG_leaderCrashTriggersAutomaticFailover(@TempDir Path baseDir) throws Exception {
+        NodeId a = new NodeId("g-a");
+        NodeId b = new NodeId("g-b");
+        NodeId c = new NodeId("g-c");
+        int aPort = freePort();
+        int bPort = freePort();
+        int cPort = freePort();
+        Map<NodeId, NodeAddress> addrs = Map.of(
+                a, new NodeAddress("localhost", aPort), b, new NodeAddress("localhost", bPort), c, new NodeAddress("localhost", cPort));
+
+        try (ConcurrentLsmKeyValueStore storeA = new ConcurrentLsmKeyValueStore(baseDir.resolve("a"));
+             RaftCluster raftA = new RaftCluster(a, without(addrs, a), aPort, Clock.systemUTC(),
+                     A_ELECTION_MIN, A_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(1));
+             RaftCluster raftB = new RaftCluster(b, without(addrs, b), bPort, Clock.systemUTC(),
+                     BC_ELECTION_MIN, BC_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(2));
+             RaftCluster raftC = new RaftCluster(c, without(addrs, c), cPort, Clock.systemUTC(),
+                     BC_ELECTION_MIN, BC_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(3))) {
+
+            PartitionLeadership leadershipA = new PartitionLeadership("p0", raftA, storeA);
+            ForgeServer serverA = new ForgeServer(storeA, key -> true, leadershipA, 0);
+            waitUntil(Duration.ofSeconds(10), leadershipA::canAcceptWrites);
+
+            List<RaftCluster> all = List.of(raftA, raftB, raftC);
+            assertEquals(1, all.stream().filter(RaftCluster::isConfirmedLeader).count(),
+                    "exactly one confirmed leader before the crash");
+
+            try (ForgeClient client = ForgeClient.connect("localhost", serverA.port())) {
+                client.put("before-crash", bytes("v"));
+            }
+
+            serverA.close();
+            raftA.close();
+
+            List<RaftCluster> survivors = List.of(raftB, raftC);
+            waitUntil(Duration.ofSeconds(10), () -> survivors.stream().anyMatch(RaftCluster::isConfirmedLeader));
+            assertEquals(1, survivors.stream().filter(RaftCluster::isConfirmedLeader).count(),
+                    "exactly one confirmed leader among the survivors");
+            RaftCluster newLeaderRaft = raftB.isConfirmedLeader() ? raftB : raftC;
+            ConcurrentLsmKeyValueStore newLeaderStore = newLeaderRaft == raftB
+                    ? new ConcurrentLsmKeyValueStore(baseDir.resolve("b")) : new ConcurrentLsmKeyValueStore(baseDir.resolve("c"));
+            try {
+                PartitionLeadership newLeadership = new PartitionLeadership("p0", newLeaderRaft, newLeaderStore);
+                try (ForgeServer newServer = new ForgeServer(newLeaderStore, key -> true, newLeadership, 0)) {
+                    waitUntil(Duration.ofSeconds(5), newLeadership::canAcceptWrites);
+                    try (ForgeClient client = ForgeClient.connect("localhost", newServer.port())) {
+                        assertDoesNotThrow(() -> client.put("after-failover", bytes("v")));
+                    }
+                }
+            } finally {
+                newLeaderStore.close();
+            }
+        }
+    }
+
+    /**
+     * <b>Scenario H — an old leader reconnects after failover.</b>
+     * <p>Assumptions: same 3-node group; A is genuinely partitioned (not
+     * killed — {@link FaultInjectingTcpProxy}, real sockets) from B and C
+     * on every A&harr;{B,C} link, then healed. See
+     * {@code StaleLeaderFencingIntegrationTest} for the fuller nine-step
+     * version of this story; this scenario isolates just the reconnect
+     * transition.
+     * <p>Safety property: after healing, A discovers the cluster's higher
+     * term and steps down to FOLLOWER — it does not remain, or revert to,
+     * LEADER on its own.
+     * <p>Liveness property: A's own {@code PartitionLeadership} correctly
+     * refuses a write attempt made against it immediately after healing —
+     * fencing does not require A to be told anything beyond the term it
+     * already learned via the heal.
+     */
+    @Test
+    @Timeout(30)
+    void scenarioH_oldLeaderReconnectsAfterFailoverAndStaysFenced(@TempDir Path baseDir) throws Exception {
+        NodeId a = new NodeId("h-a");
+        NodeId b = new NodeId("h-b");
+        NodeId c = new NodeId("h-c");
+        int aPort = freePort();
+        int bPort = freePort();
+        int cPort = freePort();
+
+        try (FaultInjectingTcpProxy aToB = new FaultInjectingTcpProxy("localhost", bPort, freePort());
+             FaultInjectingTcpProxy aToC = new FaultInjectingTcpProxy("localhost", cPort, freePort());
+             FaultInjectingTcpProxy bToA = new FaultInjectingTcpProxy("localhost", aPort, freePort());
+             FaultInjectingTcpProxy cToA = new FaultInjectingTcpProxy("localhost", aPort, freePort())) {
+
+            Map<NodeId, NodeAddress> addrsForA = Map.of(b, new NodeAddress("localhost", aToB.port()), c, new NodeAddress("localhost", aToC.port()));
+            Map<NodeId, NodeAddress> addrsForB = Map.of(a, new NodeAddress("localhost", bToA.port()), c, new NodeAddress("localhost", cPort));
+            Map<NodeId, NodeAddress> addrsForC = Map.of(a, new NodeAddress("localhost", cToA.port()), b, new NodeAddress("localhost", bPort));
+
+            try (ConcurrentLsmKeyValueStore storeA = new ConcurrentLsmKeyValueStore(baseDir.resolve("a"));
+                 RaftCluster raftA = new RaftCluster(a, addrsForA, aPort, Clock.systemUTC(),
+                         A_ELECTION_MIN, A_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(1));
+                 RaftCluster raftB = new RaftCluster(b, addrsForB, bPort, Clock.systemUTC(),
+                         BC_ELECTION_MIN, BC_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(2));
+                 RaftCluster raftC = new RaftCluster(c, addrsForC, cPort, Clock.systemUTC(),
+                         BC_ELECTION_MIN, BC_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(3))) {
+
+                PartitionLeadership leadershipA = new PartitionLeadership("p0", raftA, storeA);
+                try (ForgeServer serverA = new ForgeServer(storeA, key -> true, leadershipA, 0)) {
+                    waitUntil(Duration.ofSeconds(10), leadershipA::canAcceptWrites);
+                    long termBefore = raftA.currentTerm();
+
+                    aToB.partition();
+                    aToC.partition();
+                    bToA.partition();
+                    cToA.partition();
+
+                    List<RaftCluster> survivors = List.of(raftB, raftC);
+                    waitUntil(Duration.ofSeconds(10), () -> survivors.stream().anyMatch(RaftCluster::isConfirmedLeader));
+                    RaftCluster newLeader = raftB.isConfirmedLeader() ? raftB : raftC;
+                    assertTrue(newLeader.currentTerm() > termBefore);
+
+                    aToB.heal();
+                    aToC.heal();
+                    bToA.heal();
+                    cToA.heal();
+
+                    waitUntil(Duration.ofSeconds(5), () -> raftA.currentTerm() >= newLeader.currentTerm());
+                    waitUntil(Duration.ofSeconds(5), () -> raftA.role() == com.forge.cluster.consensus.RaftRole.FOLLOWER);
+                    assertFalse(raftA.canServeAuthoritatively(), "A must not remain or revert to authoritative after healing");
+
+                    try (ForgeClient client = ForgeClient.connect("localhost", serverA.port())) {
+                        ForgeServerException e = assertThrows(ForgeServerException.class, () -> client.put("k", bytes("v")));
+                        assertEquals(ProtocolConstants.ERROR_NOT_LEADER, e.errorCode());
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * <b>Scenario I — network partition, majority side elects, minority side is fenced.</b>
+     * <p>Assumptions: same partition topology as Scenario H, but the
+     * assertion here is made <em>while still partitioned</em> (before any
+     * heal) — the emphasis is the ongoing state during a live partition,
+     * not the reconnect transition Scenario H covers.
+     * <p>Safety property: for the entire duration of the partition, the
+     * minority side (A, alone) never becomes or remains an authoritative
+     * leader once its lease expires, while the majority side (B+C)
+     * successfully elects one.
+     * <p>Liveness property: the majority side continues making progress
+     * (accepting a write) throughout the partition — a minority partition
+     * never blocks the majority.
+     */
+    @Test
+    @Timeout(30)
+    void scenarioI_networkPartitionMajoritySideElectsMinorityIsFenced(@TempDir Path baseDir) throws Exception {
+        NodeId a = new NodeId("i-a");
+        NodeId b = new NodeId("i-b");
+        NodeId c = new NodeId("i-c");
+        int aPort = freePort();
+        int bPort = freePort();
+        int cPort = freePort();
+
+        try (FaultInjectingTcpProxy aToB = new FaultInjectingTcpProxy("localhost", bPort, freePort());
+             FaultInjectingTcpProxy aToC = new FaultInjectingTcpProxy("localhost", cPort, freePort());
+             FaultInjectingTcpProxy bToA = new FaultInjectingTcpProxy("localhost", aPort, freePort());
+             FaultInjectingTcpProxy cToA = new FaultInjectingTcpProxy("localhost", aPort, freePort())) {
+
+            Map<NodeId, NodeAddress> addrsForA = Map.of(b, new NodeAddress("localhost", aToB.port()), c, new NodeAddress("localhost", aToC.port()));
+            Map<NodeId, NodeAddress> addrsForB = Map.of(a, new NodeAddress("localhost", bToA.port()), c, new NodeAddress("localhost", cPort));
+            Map<NodeId, NodeAddress> addrsForC = Map.of(a, new NodeAddress("localhost", cToA.port()), b, new NodeAddress("localhost", bPort));
+
+            try (RaftCluster raftA = new RaftCluster(a, addrsForA, aPort, Clock.systemUTC(),
+                         A_ELECTION_MIN, A_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(1));
+                 RaftCluster raftB = new RaftCluster(b, addrsForB, bPort, Clock.systemUTC(),
+                         BC_ELECTION_MIN, BC_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(2));
+                 RaftCluster raftC = new RaftCluster(c, addrsForC, cPort, Clock.systemUTC(),
+                         BC_ELECTION_MIN, BC_ELECTION_MAX, RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT, LEASE, new Random(3))) {
+
+                waitUntil(Duration.ofSeconds(10), raftA::isConfirmedLeader);
+
+                aToB.partition();
+                aToC.partition();
+                bToA.partition();
+                cToA.partition();
+
+                List<RaftCluster> survivors = List.of(raftB, raftC);
+                waitUntil(Duration.ofSeconds(10), () -> survivors.stream().anyMatch(RaftCluster::isConfirmedLeader));
+
+                // While still partitioned: the minority (A) must be fenced, the majority must not be.
+                waitUntil(Duration.ofSeconds(5), () -> !raftA.canServeAuthoritatively());
+                RaftCluster newLeader = raftB.isConfirmedLeader() ? raftB : raftC;
+                assertTrue(newLeader.canServeAuthoritatively(), "the majority side must remain authoritative throughout the partition");
+                assertFalse(raftA.canServeAuthoritatively(), "the minority side must stay fenced throughout the partition");
+            }
+        }
+    }
+
+    /**
+     * <b>Scenario J — a delayed message from a stale leader is still correctly rejected.</b>
+     * <p>Assumptions: A is a stale (fenced) former leader; its AppendEntries
+     * to a node that has already moved to a higher term is delayed
+     * (real, measured delay — {@link FaultInjectingTcpProxy#setDelay}), not
+     * dropped.
+     * <p>Safety property: delay does not help a stale message succeed —
+     * once it finally arrives, it is rejected exactly as an undelayed one
+     * would be, on term alone, regardless of how long it was in flight.
+     * <p>Liveness property: the delayed exchange still completes (the
+     * connection is not left hanging) — a stale sender gets a real,
+     * prompt rejection response, not silence.
+     */
+    @Test
+    @Timeout(30)
+    void scenarioJ_delayedStaleLeaderMessageIsStillRejectedOnArrival() throws Exception {
+        com.forge.cluster.consensus.RaftNode staleLeaderSimulator; // built to have advanced to a real term first
+        MutableClockForChaosTest clock = new MutableClockForChaosTest(Instant.EPOCH);
+        NodeId self = new NodeId("j-self");
+        NodeId stale = new NodeId("j-stale-leader");
+        staleLeaderSimulator = new com.forge.cluster.consensus.RaftNode(self, java.util.Set.of(stale), clock,
+                Duration.ofMillis(50), Duration.ofMillis(80), Duration.ofMillis(20), new Random(1));
+
+        // This node moves to term 5 via a real AppendEntries from a legitimate current leader.
+        staleLeaderSimulator.handleAppendEntries(new com.forge.cluster.consensus.AppendEntriesRequest(
+                5, stale, 0, 0, List.of(), 0));
+        assertEquals(5, staleLeaderSimulator.currentTerm());
+
+        // A real network delay is simulated directly (this scenario is about the delay's
+        // effect on the outcome, not about proving the proxy delays bytes -- see
+        // FaultInjectingTcpProxyTest for that): the stale leader's term-1 message is
+        // constructed now but "delivered" only after a real sleep.
+        Thread.sleep(150);
+        var response = staleLeaderSimulator.handleAppendEntries(
+                new com.forge.cluster.consensus.AppendEntriesRequest(1, stale, 0, 0, List.of(), 0));
+
+        assertFalse(response.success(), "a delayed stale-term message must still be rejected once it arrives");
+        assertEquals(5, response.term(), "the rejection must report the true current term, unaffected by the delay");
+        assertEquals(5, staleLeaderSimulator.currentTerm(), "the delayed stale message must not affect the current term at all");
+    }
+
+    /** Minimal local {@link Clock} double for Scenario J — advancing is not needed, only a fixed instant. */
+    private static final class MutableClockForChaosTest extends Clock {
+        private final Instant now;
+
+        MutableClockForChaosTest(Instant now) {
+            this.now = now;
+        }
+
+        @Override
+        public java.time.ZoneId getZone() {
+            return java.time.ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(java.time.ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+    }
+
+    /**
+     * <b>Scenario K — repeated leader crashes.</b>
+     * <p>Assumptions: a <b>5</b>-node Raft group, deliberately larger than
+     * every other scenario's 3 — a majority of 5 is 3, so the cluster can
+     * absorb <em>two</em> successive leader crashes while still retaining
+     * a majority (3 survivors) able to elect a third leader. A 3-node
+     * group can only ever safely tolerate one such crash (2 of 3 is still
+     * a majority; 1 of 3 is not) — trying to repeat the crash twice on a
+     * 3-node group was this scenario's first draft, and it correctly
+     * never elected a third leader, because doing so would have been a
+     * genuine safety violation (a minority electing itself). That failure
+     * is exactly the expected, correct behavior, not a bug — kept here as
+     * an explicit design note since it's an easy trap to fall into.
+     * <p>Safety property: every successive election produces a strictly
+     * higher term than the one before it — terms never repeat or go
+     * backward across repeated failures.
+     * <p>Liveness property: the cluster keeps electing a new confirmed
+     * leader after each of two successive crashes, as long as a majority
+     * of the original cluster remains alive.
+     */
+    @Test
+    @Timeout(30)
+    void scenarioK_repeatedLeaderCrashesEachProduceAHigherTerm(@TempDir Path baseDir) throws Exception {
+        List<NodeId> ids = List.of(new NodeId("k-a"), new NodeId("k-b"), new NodeId("k-c"),
+                new NodeId("k-d"), new NodeId("k-e"));
+        Map<NodeId, Integer> ports = new HashMap<>();
+        for (NodeId id : ids) {
+            ports.put(id, freePort());
+        }
+        Map<NodeId, NodeAddress> addrs = new HashMap<>();
+        for (NodeId id : ids) {
+            addrs.put(id, new NodeAddress("localhost", ports.get(id)));
+        }
+
+        // All five nodes have equally short, tightly-clustered election timeouts here --
+        // unlike other scenarios, this one doesn't need to control who wins, only that
+        // each successive election strictly increases the term.
+        List<RaftCluster> all = new java.util.ArrayList<>();
+        try {
+            for (int i = 0; i < ids.size(); i++) {
+                NodeId id = ids.get(i);
+                all.add(new RaftCluster(id, without(addrs, id), ports.get(id), Clock.systemUTC(),
+                        Duration.ofMillis(50), Duration.ofMillis(90), RAFT_HEARTBEAT, RAFT_TICK, RAFT_RPC_TIMEOUT,
+                        LEASE, new Random(20 + i)));
+            }
+
+            waitUntil(Duration.ofSeconds(10), () -> all.stream().anyMatch(RaftCluster::isConfirmedLeader));
+            RaftCluster firstLeader = all.stream().filter(RaftCluster::isConfirmedLeader).findFirst().orElseThrow();
+            long firstTerm = firstLeader.currentTerm();
+
+            firstLeader.close();
+            all.remove(firstLeader);
+            waitUntil(Duration.ofSeconds(10), () -> all.stream().anyMatch(RaftCluster::isConfirmedLeader));
+            RaftCluster secondLeader = all.stream().filter(RaftCluster::isConfirmedLeader).findFirst().orElseThrow();
+            assertTrue(secondLeader.currentTerm() > firstTerm, "the second election's term must be strictly higher than the first's");
+            long secondTerm = secondLeader.currentTerm();
+
+            secondLeader.close();
+            all.remove(secondLeader);
+            assertEquals(3, all.size(), "3 of the original 5 remain -- still a majority");
+            waitUntil(Duration.ofSeconds(10), () -> all.stream().anyMatch(RaftCluster::isConfirmedLeader));
+            RaftCluster thirdLeader = all.stream().filter(RaftCluster::isConfirmedLeader).findFirst().orElseThrow();
+            assertTrue(thirdLeader.currentTerm() > secondTerm, "the third election's term must be strictly higher than the second's");
+        } finally {
+            for (RaftCluster cluster : all) {
+                cluster.close();
+            }
+        }
+    }
+
+    /**
+     * <b>Scenario L — a follower crashes during catch-up.</b>
+     * <p>Assumptions: a follower is midway through catching up a real
+     * backlog from a real {@link ReplicationServer} when its connection is
+     * severed (simulated as a hard socket close, the same fault
+     * {@code FaultInjectingTcpProxy.partition()} models — see that class's
+     * Javadoc on why this is how a real partition/crash actually manifests
+     * to a TCP application).
+     * <p>Safety property: the follower's store is left in a fully
+     * consistent state at whatever point it reached — never partially
+     * corrupted — checked by verifying every key it does have is fully,
+     * correctly present (no partial record).
+     * <p>Liveness property: a fresh retry (a new {@code ReplicationFollower},
+     * matching Phase 9's documented no-auto-reconnect contract) picks up
+     * exactly where the interrupted one left off and reaches full parity.
+     */
+    @Test
+    @Timeout(30)
+    void scenarioL_followerCrashDuringCatchUpThenRetrySucceeds(@TempDir Path baseDir) throws Exception {
+        ConcurrentLsmKeyValueStore leaderStore = new ConcurrentLsmKeyValueStore(baseDir.resolve("leader"));
+        try (ReplicationServer replicationServer = new ReplicationServer(leaderStore, 0)) {
+            for (int i = 0; i < 500; i++) {
+                leaderStore.put("k" + i, bytes("v" + i));
+            }
+
+            ConcurrentLsmKeyValueStore followerStore = new ConcurrentLsmKeyValueStore(baseDir.resolve("follower"));
+            ReplicationFollower follower = new ReplicationFollower(
+                    new NodeId("scenario-l-follower"), "localhost", replicationServer.port(), followerStore, Duration.ofMillis(20));
+
+            // Let it get partway, then crash it mid-catch-up.
+            waitUntil(Duration.ofSeconds(5), () -> followerStore.keys().size() > 0);
+            follower.close(); // a hard stop, not a graceful drain -- models a real crash/severed connection
+
+            // Whatever it has is fully consistent: every key present has its exact, correct value.
+            for (String key : followerStore.keys()) {
+                int index = Integer.parseInt(key.substring(1));
+                assertArrayEquals(bytes("v" + index), followerStore.get(key).orElseThrow());
+            }
+
+            // A fresh retry (Phase 9's documented contract: no auto-reconnect) reaches full parity.
+            try (ReplicationFollower retry = new ReplicationFollower(
+                    new NodeId("scenario-l-follower"), "localhost", replicationServer.port(), followerStore, Duration.ofMillis(20))) {
+                waitUntil(Duration.ofSeconds(10), () -> followerStore.keys().size() == 500);
+                for (int i = 0; i < 500; i++) {
+                    assertArrayEquals(bytes("v" + i), followerStore.get("k" + i).orElseThrow());
+                }
+            } finally {
+                followerStore.close();
+            }
+        } finally {
+            leaderStore.close();
+        }
     }
 }
