@@ -170,9 +170,47 @@ the paper's Figure 8 commit-safety rule — used as the **control plane**
 for deciding which node currently leads. Deliberately not a replacement
 for §3.8's replication: Raft's own log carries nothing but a one-entry-per-
 election marker, never real KV writes. See PROGRESS.md's Phase 14 section
-for the precise scope (no persistent Raft state; not yet wired into
-§3.8/§3.4's live runtime — the integration signal exists,
-`RaftCluster.isConfirmedLeader()`, but nothing consumes it yet).
+for the precise scope (no persistent Raft state — see that section for the
+disclosed gap this leaves).
+
+### 3.13 Fenced data-plane leadership & automated failover (Phase 15)
+Phase 14's consensus result is wired into §3.4/§3.8's live runtime via
+`forge-cluster`'s `leadership` package:
+- **`PartitionLeadership`** implements `WriteAuthority` (a small interface
+  in `forge-server`, added so the dependency points the right direction —
+  `forge-cluster` already depends on `forge-server`), backing
+  `ForgeServer`'s new write-fencing gate with `RaftCluster.canServeAuthoritatively()`
+  — not `isConfirmedLeader()` alone, which never notices a silently
+  partitioned-away leader. See §5's leader-lease explanation below.
+- **`SequenceEpochs`** gives each Raft term a disjoint band of WAL
+  sequence numbers, making a failover-induced sequence collision (old
+  leader's unreplicated tail vs. new leader's first writes) structurally
+  impossible, with no change to the WAL/replication wire formats.
+- **`ReplicationFollowerCoordinator`** keeps each node's
+  `ReplicationFollower` pointed at whoever Raft currently designates
+  leader, redirecting automatically on failover.
+- **`StaleReplicaRecovery`** performs a full snapshot-based resync (Phase
+  10's existing transfer mechanism) for the one case incremental catch-up
+  can't safely cover: a rejoining node whose own prior data might be
+  divergent.
+
+**The leader-lease fencing mechanism, precisely**: `RaftNode` now tracks,
+per peer, the timestamp of its most recent successful AppendEntries
+acknowledgment in the current term. `hasRecentQuorumContact(within)`
+answers "have I had real contact with a majority recently" — a leader
+that won an election and is then partitioned away stops being able to
+answer "yes" once `within` elapses, purely from its own clock, with no
+message from anyone telling it so. This is the mechanism that closes the
+"alive but stale, never told" gap named in PROGRESS.md's Phase 15 section
+— see `docs/CONSISTENCY.md` §5 for the guarantee this provides and its
+precise, bounded limits.
+
+**What this does not do**: convert replication from asynchronous to
+synchronous (deliberately unchanged — DESIGN.md §2), or extend fencing to
+`GET` (deliberately unchanged — reads are answered locally on any node,
+leader or not), or support more than one Raft group per node/partition
+(single-partition scope this phase — see PROGRESS.md's Phase 15 known
+limitations).
 
 ## 4. Repository structure
 

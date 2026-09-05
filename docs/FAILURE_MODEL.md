@@ -57,10 +57,31 @@ precise reasoning behind treating the two differently).
 - **A slow-but-alive node will be misclassified as dead** once it misses
   heartbeats for `deadTimeout` — the fundamental, named tradeoff of any
   fixed-timeout failure detector (`FailureDetector`'s own class Javadoc).
-- **Raft is not yet wired into live data-plane failover.** Electing a new
-  leader (control plane) does not yet automatically redirect
-  `ReplicationServer`/`ReplicationFollower` (data plane) — see
-  PROGRESS.md's Phase 14 known limitations.
+- **Fencing has a bounded, non-zero staleness window, not an instantaneous
+  guarantee.** As of Phase 15, a partitioned-but-alive leader self-fences
+  via a leader-lease check (`RaftNode.hasRecentQuorumContact`) — but only
+  after roughly `leaseDuration` (default: the cluster's minimum election
+  timeout) has passed since it last had real contact with a majority. A
+  write arriving in that window can still be incorrectly accepted. See
+  `docs/CONSISTENCY.md` §5 and `RaftNode`'s class Javadoc.
+- **`ReplicationFollowerCoordinator`'s automatic recovery covers ordinary
+  live failover, not every rejoin case.** A node whose own local data
+  might be divergent (most likely a former leader restarting) is detected
+  and flagged (`needsFullResync()`), but the actual repair
+  (`StaleReplicaRecovery`) must be invoked explicitly by a caller — it is
+  not performed automatically, since doing so would require swapping a
+  live `ForgeServer`'s store instance out from under it. See PROGRESS.md's
+  Phase 15 known limitations.
+- **`SnapshotClient`/`ReplicationFollower`'s initial handshake has no
+  socket-level read timeout.** A genuinely stuck peer, or a caller
+  connecting to the wrong protocol/port entirely, hangs indefinitely
+  rather than failing fast. Pre-existing since Phase 9/10; surfaced (as a
+  test bug, not a production incident) while building Phase 15; not fixed.
+- **Single-partition/single-replica-set scope.** Phase 15's fencing and
+  failover machinery models one Raft group controlling one partition's
+  replica set. A real multi-partition deployment needs one such group per
+  partition — the abstractions don't need to change shape, just be
+  instantiated more than once; not built or tested at that scale.
 
 ## 4. What *is* proven, and how
 
@@ -88,3 +109,18 @@ test behind it:
   strictly higher term** — `RaftClusterIntegrationTest`.
 - **An old-term log entry is never committed by direct majority count
   alone (Raft's Figure 8 safety property)** — `RaftNodeTest` scenario 7.
+- **A leader that is alive but genuinely, bidirectionally
+  network-partitioned away from the rest of the cluster — never receiving
+  a single message about a new term existing — self-fences from writes
+  purely from the passage of time, stays fenced through healing, and the
+  survivors' new leader remains authoritative throughout** —
+  `StaleLeaderFencingIntegrationTest` (the Phase 15 mandatory test) and
+  chaos Scenarios H/I. Run repeatedly with no flakiness observed.
+- **Real KV data keeps flowing through a newly-elected leader after a
+  failover, with no sequence-number collision against the old leader's
+  abandoned writes, and a rejoining old leader is fully, correctly
+  resynced (not left silently divergent)** —
+  `FailoverReplicationIntegrationTest`.
+- **A cluster survives two successive leader crashes (given enough nodes
+  to retain a majority each time), with a strictly higher term after
+  each** — chaos Scenario K.

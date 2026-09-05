@@ -43,7 +43,9 @@ over the network for external/remote inspection of a running server:
 |---|---|---|
 | Cluster membership view | `FailureDetector.snapshot()` | `forge-cluster` (Phase 8) |
 | Partition ownership | `ClusterTopology`/`ConsistentHashRing.ownerOf(key)` | `forge-cluster` (Phase 7) |
-| Raft role/term/leader | `RaftCluster.role()` / `currentTerm()` / `currentLeader()` / `isConfirmedLeader()` | `forge-cluster` (Phase 14) |
+| Raft role/term/leader/fencing | `RaftCluster.role()` / `currentTerm()` / `currentLeader()` / `isConfirmedLeader()` / `canServeAuthoritatively()` | `forge-cluster` (Phase 14/15) |
+| Write-fencing status for a partition | `PartitionLeadership.canAcceptWrites()` | `forge-cluster` (Phase 15) |
+| Whether a node needs a full resync on rejoin | `ReplicationFollowerCoordinator.needsFullResync()` | `forge-cluster` (Phase 15) |
 | Replication lag | `ReplicaState` (tracked internally by `ReplicationServer`) | `forge-cluster` (Phase 9) |
 | Throughput/latency | `forge-bench`'s `BenchmarkResult`/`LatencyStats` | `forge-bench` (Phase 6/12) — measured by *driving load*, not queried from a live server |
 

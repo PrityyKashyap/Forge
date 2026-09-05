@@ -205,13 +205,102 @@ remain the unmodified data plane. This was an explicit project
 requirement ("do not merely rename the existing replication system
 Raft") satisfied by construction, not just by naming.
 
-**What's the biggest thing this Raft implementation doesn't do yet?**
-Two things, both disclosed rather than glossed over: it keeps no
-persistent state (a crash-restart mid-term could in principle vote twice
-in that term — a narrow, real gap vs. the paper), and it isn't wired into
-live data-plane failover yet — `RaftCluster.isConfirmedLeader()` is the
-intended integration signal, but nothing in `ForgeServer` or the
-replication path consumes it today.
+**What's the biggest thing this Raft implementation still doesn't do?**
+It keeps no persistent state — a crash-restart mid-term could in
+principle vote twice in that term, a narrow, real gap vs. the paper,
+disclosed in `RaftNode`'s Javadoc. (As of Phase 15, it *is* wired into
+live data-plane failover — see the next section.)
+
+## Data-plane failover & fencing (Phase 15)
+
+**How does Raft actually control the data plane?**
+`ForgeServer` is constructed with a `WriteAuthority` — for a Raft-managed
+partition, that's `PartitionLeadership`, which delegates to
+`RaftCluster.canServeAuthoritatively()`. Every `PUT`/`DELETE` calls
+`writeAuthority.canAcceptWrites()` before touching the store; a `false`
+means `ERROR_NOT_LEADER`, never applied. Separately,
+`ReplicationFollowerCoordinator` polls `RaftCluster.currentLeader()` and
+keeps each node's `ReplicationFollower` pointed at whoever it currently
+names. Two independent consumers of the same one signal — no new
+coupling between Raft's internals and replication's internals.
+
+**How do you prevent a stale leader from continuing to serve writes?**
+Two layers. First, the fast path: any RPC or response carrying a higher
+term makes a node step down immediately (`RaftNode.stepDownToFollower`,
+unchanged since Phase 14). Second — the layer Phase 15 actually added —
+the slow path for a node that never receives such a message because it's
+genuinely partitioned away: `RaftNode.hasRecentQuorumContact(leaseDuration)`
+tracks the timestamp of each peer's most recent successful AppendEntries
+ack in the current term, and answers false once a majority's worth of
+those acks are older than `leaseDuration`. `canServeAuthoritatively()` is
+`isConfirmedLeader() && hasRecentQuorumContact(...)` — a leader that's
+alive but isolated stops passing that check purely from the passage of
+its own clock, without needing anyone to tell it anything.
+
+**What happens during a network partition?**
+The minority side's leader (if any) loses quorum contact and self-fences
+within one lease duration; the majority side, if it has one, elects a new
+leader and keeps serving. Proved directly: chaos Scenario I asserts both
+halves *during* the partition (majority authoritative, minority fenced,
+simultaneously); `StaleLeaderFencingIntegrationTest` and Scenario H add
+the reconnect-afterward story (the old leader discovers the higher term
+and stays fenced once healed).
+
+**How does fencing interact with sequence numbers across a failover?**
+This was the subtle part. Without `SequenceEpochs`, a promoted follower's
+first new write would get the *next* sequence number after wherever it
+had already caught up to — which could collide with a different write the
+old leader had assigned that same number to, if the old leader got further
+ahead locally than it ever replicated. `SequenceEpochs.bandStart(term)`
+gives every term a disjoint billion-wide range; both the new leader
+(on confirming) and every follower (on redirecting to it) ratchet their
+own store into that band *before* any new data flows, so the numbers can
+never collide — with zero changes to the WAL record format, the
+replication wire format, or the gap-detection logic that already existed.
+
+**What happens to async-replicated writes after a leader failure?**
+Exactly what Phase 9/11 already disclosed, unchanged: whatever the old
+leader had already shipped to a follower survives and is fully usable;
+whatever it had only applied locally and never shipped is not recovered
+by anything in this codebase — it's simply left behind in the old
+leader's own local state. Phase 15 does not make this better or worse; it
+only stops the old leader from adding *more* such orphaned writes once
+its lease expires.
+
+**How does an old leader rejoin safely?**
+Its fresh `RaftNode` (no persistent state — see above) learns the current
+term from a real message and steps down. Its `ReplicationFollowerCoordinator`
+then checks: is this the *first* time (this process's life) it's
+considered following anyone, and does its existing data imply an older
+term than the cluster's current one? If so, it flags `needsFullResync()`
+rather than guessing — its local data might hold orphaned writes an
+incremental catch-up can't retroactively fix. A caller then invokes
+`StaleReplicaRecovery.resyncFromSnapshot`, which wipes the node's local
+directory and reloads it completely from a live `SnapshotServer` (Phase
+10's existing transfer mechanism, unmodified). If the node was always
+just a plain follower — never originated a write — later failovers skip
+this check entirely and it just reconnects incrementally, since a pure
+follower's data can never actually diverge.
+
+**Why is Raft still not simply the existing replication system renamed?**
+Same answer as Phase 14, now with a concrete data-plane consequence to
+point at: Raft's own log still carries nothing but one no-op per
+election. If Phase 15 had instead made Raft's log carry real KV writes,
+it would have needed to either duplicate everything `ReplicationServer`/
+`ReplicationFollower` already do correctly, or rip out Phase 9 entirely —
+neither happened. What Phase 15 added is a *coordinate* (the term, via
+`SequenceEpochs`) the two independent systems now both respect, not a
+merger of the two.
+
+**What are the exact consistency guarantees, precisely?**
+Writes: accepted only by a node currently, recently confirmed
+authoritative (bounded lease window, not instantaneous). Reads:
+deliberately never fenced — any node, including a demoted former leader,
+answers `GET` from local data. Durability: still async-only; a write
+acknowledged by an authoritative leader can still be lost if that leader
+crashes before replicating it anywhere — Raft's commit mechanism and KV
+write durability are two separate things that were never merged. See
+`docs/CONSISTENCY.md` §5 for the full, precise table.
 
 ## Benchmarking
 

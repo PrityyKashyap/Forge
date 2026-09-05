@@ -2,12 +2,13 @@
 
 A distributed key-value database, built incrementally, from scratch, in Java.
 
-**Status: all 8 core phases complete** (partitioning, membership/failure
-detection, replication, recovery, chaos testing, distributed benchmarking,
-compaction/Bloom filters, and Raft consensus) — 444/444 tests passing. See
-[PROGRESS.md](PROGRESS.md) for the full phase-by-phase log, including real
-bugs found and fixed along the way, and this README's [Limitations](#21-limitations)
-section for what's honestly not done yet.
+**Status: all 8 core phases complete, plus Phase 15** (partitioning,
+membership/failure detection, replication, recovery, chaos testing,
+distributed benchmarking, compaction/Bloom filters, Raft consensus, and
+Raft-driven data-plane failover with stale-leader fencing) — 472/472
+tests passing. See [PROGRESS.md](PROGRESS.md) for the full phase-by-phase
+log, including real bugs found and fixed along the way, and this README's
+[Limitations](#22-limitations) section for what's honestly not done yet.
 
 ## 1. What FORGE is, and why it exists
 
@@ -61,7 +62,8 @@ forge-server/   TCP server + connection handling on top of forge-storage.
 forge-client/   Client library (ForgeClient).
 forge-cluster/  Consistent hashing/partitioning, membership & failure
                 detection, replication, snapshot recovery, chaos/fault
-                injection, Raft consensus.
+                injection, Raft consensus, and Raft-driven data-plane
+                failover/fencing (the `leadership` package).
 forge-bench/    Load generators + latency/throughput/amplification
                 measurement — every number in BENCHMARKS.md comes from here.
 tests/          Cross-module integration tests (real multi-node processes).
@@ -168,7 +170,7 @@ network partition, message delay, bootstrap-crash, stale membership) each
 state their assumptions, safety property, and liveness property up front
 — see [PROGRESS.md](PROGRESS.md)'s Phase 11 section for what each proved.
 
-## 14. Consensus & automated failover (Raft)
+## 14. Consensus (Raft)
 
 A real Raft implementation (`forge-cluster`'s `consensus` package) —
 terms, majority-vote leader election, AppendEntries replication, and the
@@ -181,10 +183,43 @@ scenarios (split votes, stale leaders, log inconsistency, the Figure 8
 trap, and more) are proven with a fake clock in `RaftNodeTest`; a real
 3-node election and crash-failover are proven over real sockets in
 `RaftClusterIntegrationTest`. **Honestly scoped**: no persistent Raft
-state, and not yet wired into live data-plane failover — see
-[PROGRESS.md](PROGRESS.md)'s Phase 14 section.
+state — see [PROGRESS.md](PROGRESS.md)'s Phase 14 section.
 
-## 15. Benchmarks
+## 15. Fenced data-plane leadership & automated failover (Phase 15)
+
+Phase 14's consensus result is wired into live write acceptance:
+`ForgeServer` now fences every `PUT`/`DELETE` on `RaftCluster.canServeAuthoritatively()`
+— a **leader-lease** check (`RaftNode.hasRecentQuorumContact`), not just
+"did I win an election," so a leader that's silently, genuinely
+partitioned away self-fences within a bounded window purely from the
+passage of time, even though it never receives a single message telling
+it a new term exists. A term-banded sequence-number scheme
+(`SequenceEpochs`) makes a failover-induced sequence collision (an old
+leader's unreplicated writes vs. a new leader's first writes) structurally
+impossible, with no change to the WAL or replication wire format.
+`ReplicationFollowerCoordinator` automatically redirects each node's
+replication connection to whoever Raft currently designates leader; a
+rejoining node whose own data might be divergent is detected and, via an
+explicit `StaleReplicaRecovery` call, fully resynced from a live snapshot
+rather than trusted incrementally.
+
+**Proven, not just described**: the mandatory scenario — a leader alive
+but genuinely network-partitioned, never told about a new term, that must
+still reject writes — passes in `StaleLeaderFencingIntegrationTest` over
+real sockets with a real `FaultInjectingTcpProxy` partition (run
+repeatedly with no flakiness). Real data keeps flowing through a new
+leader after failover, and a rejoining old leader is correctly resynced,
+in `FailoverReplicationIntegrationTest`. Six more named chaos scenarios
+(G-L) cover leader crash, partition-then-heal, delayed stale messages,
+repeated crashes, and crash-during-catch-up. **Honestly scoped**: the
+fencing window is bounded (~one lease duration), not instantaneous;
+`GET` remains deliberately unfenced on every node; this models one Raft
+group per partition's replica set, not a full multi-partition deployment
+— see [docs/CONSISTENCY.md](docs/CONSISTENCY.md) §5 and
+[PROGRESS.md](PROGRESS.md)'s Phase 15 section for the complete, precise
+account of what is and isn't guaranteed.
+
+## 16. Benchmarks
 
 Every number is measured, client-observed, and reproducible from this
 repository — never estimated. Highlights (full detail and methodology in
@@ -207,8 +242,12 @@ repository — never estimated. Highlights (full detail and methodology in
   not asserted as a FORGE design flaw, and explicitly flagged as something
   this benchmark (single machine, no second machine available) cannot
   resolve on its own.
+- Real Raft failover completes in ~0.35s on average (3-node, loopback),
+  bounded by the survivors' own randomized election timeout window; the
+  data plane resumes serving writes within single-digit milliseconds of
+  the control plane confirming a leader (§9).
 
-## 16. How to build and test
+## 17. How to build and test
 
 Requires Java 21+ and Maven.
 
@@ -216,10 +255,10 @@ Requires Java 21+ and Maven.
 mvn clean install    # builds all 7 modules, runs all tests
 ```
 
-444 tests across `forge-common`, `forge-storage`, `forge-server`,
+472 tests across `forge-common`, `forge-storage`, `forge-server`,
 `forge-client`, `forge-cluster`, `forge-bench`, and `tests` (0 failures).
 
-## 17. How to run a single node
+## 18. How to run a single node
 
 ```bash
 mvn -pl forge-server -am install -DskipTests
@@ -242,10 +281,10 @@ Inspect a **stopped** node's storage-engine state:
 mvn -pl forge-server exec:java -Dexec.args="status <dataDirectory>"
 ```
 
-## 18. How to run a multi-node cluster / partitioning / replication / failover
+## 19. How to run a multi-node cluster / partitioning / replication / failover
 
 There is currently no single "launch a full N-node cluster" CLI (see
-[Limitations](#21-limitations)) — but every one of these behaviors is
+[Limitations](#22-limitations)) — but every one of these behaviors is
 real, already wired together, and demonstrated end-to-end by the
 integration tests below, each spinning up genuine separate
 `ForgeServer`/`ReplicationServer`/`RaftCluster` instances with real socket
@@ -258,55 +297,74 @@ mvn -pl tests -am test -Dtest=PartitioningIntegrationTest -Dsurefire.failIfNoSpe
 mvn -pl forge-cluster -am test -Dtest=ReplicationIntegrationTest -Dsurefire.failIfNoSpecifiedTests=false
 # bootstrap-from-snapshot recovery:
 mvn -pl forge-cluster -am test -Dtest=SnapshotTransferIntegrationTest -Dsurefire.failIfNoSpecifiedTests=false
-# real election + leader-crash failover:
+# real election + leader-crash failover (control plane only):
 mvn -pl forge-cluster -am test -Dtest=RaftClusterIntegrationTest -Dsurefire.failIfNoSpecifiedTests=false
+# real election + leader-crash failover, WITH data actually flowing through
+# the new leader and the old leader resyncing on rejoin (control + data plane):
+mvn -pl forge-cluster -am test -Dtest=FailoverReplicationIntegrationTest -Dsurefire.failIfNoSpecifiedTests=false
+# the mandatory "leader is alive but stale" fencing test (real network partition):
+mvn -pl forge-cluster -am test -Dtest=StaleLeaderFencingIntegrationTest -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
 See [docs/DEMO.md](docs/DEMO.md) for a scripted walkthrough of these, in
 order, with what to look for in the output.
 
-## 19. How to run the failure-injection demos
+## 20. How to run the failure-injection demos
 
 ```bash
 mvn -pl forge-cluster -am test -Dtest=ChaosScenarioTest -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
-Runs all six named chaos scenarios (leader crash, follower rejoin,
-network partition, message delay, bootstrap-crash, stale membership)
-against real sockets with deterministic (not random) fault injection.
+Runs twelve named chaos scenarios against real sockets with deterministic
+(not random) fault injection: the original six (leader crash, follower
+rejoin, network partition, message delay, bootstrap-crash, stale
+membership) plus six added for Phase 15's failover/fencing (leader crash
++ automatic failover, old-leader reconnect, network partition + majority
+election, delayed stale-leader message, repeated leader crashes,
+follower crash during catch-up).
 
-## 20. How to run the benchmarks
+## 21. How to run the benchmarks
 
 ```bash
 mvn install -DskipTests
 mvn -pl forge-bench exec:java -Dexec.mainClass=com.forge.bench.BenchmarkRunner              # Phase 6: single-node baselines
 mvn -pl forge-bench exec:java -Dexec.mainClass=com.forge.bench.DistributedBenchmarkRunner    # Phase 12: multi-node/replication
 mvn -pl forge-bench exec:java -Dexec.mainClass=com.forge.bench.CompactionBenchmarkRunner     # Phase 13: compaction amplification
+mvn -pl forge-bench exec:java -Dexec.mainClass=com.forge.bench.FailoverBenchmarkRunner       # Phase 15: failover timing
 ```
 
 Each writes a timestamped CSV to `forge-bench/results/` and prints a
 human-readable summary — see [BENCHMARKS.md](docs/BENCHMARKS.md) for what
 the numbers mean.
 
-## 21. Limitations
+## 22. Limitations
 
 Stated plainly, not softened — see [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md)
-and [docs/CONSISTENCY.md](docs/CONSISTENCY.md) for full detail on the
-first three:
+and [docs/CONSISTENCY.md](docs/CONSISTENCY.md) for full detail:
 
-- **No fencing/epoch mechanism** — two nodes can both believe themselves
-  leader of the same partition after a split-brain event; nothing today
-  prevents it. Raft (§14) is the mechanism that *would* close this once
-  wired into the data plane, which it isn't yet.
+- **Fencing has a bounded, non-zero staleness window** — a leader that's
+  genuinely, silently partitioned away can still incorrectly accept a
+  write for up to roughly one lease duration (default: the cluster's
+  minimum election timeout) after it actually loses contact with a
+  majority. Closed within that window (§15), not instantaneously.
+- **Fencing/failover models one Raft group per partition's replica set**
+  — a full multi-partition deployment (one such group per partition) is a
+  natural extension, not built or tested at that scale.
 - **Replication is async-only** — a write acknowledged by a leader can be
-  lost if the leader crashes before replicating it anywhere.
+  lost if the leader crashes before replicating it anywhere; Phase 15
+  bounds how much *worse* this can get (fencing the old leader from
+  accepting *more* such writes) but doesn't retroactively protect
+  already-orphaned ones.
 - **Raft has no persistent state** — a node that crashes and restarts
   mid-term rejoins as a brand-new participant; a narrow theoretical
   safety gap relative to the paper, disclosed in `RaftNode`'s Javadoc.
+- **Full resync on rejoin is detected but not auto-performed** — a
+  caller must explicitly invoke `StaleReplicaRecovery`; see
+  [PROGRESS.md](PROGRESS.md)'s Phase 15 known limitations for why.
 - **No authentication, authorization, or transport encryption** — every
   TCP connection is trusted.
 - **No multi-node CLI launcher** — real multi-node behavior is proven by
-  the integration tests (§18), not a standalone "start a cluster" command.
+  the integration tests (§19), not a standalone "start a cluster" command.
 - **No network-queryable admin/metrics endpoint** — real metrics exist as
   Java accessors (`RaftCluster.currentLeader()`, `FailureDetector.snapshot()`,
   `ConcurrentLsmKeyValueStore.status()`) but aren't exposed remotely; see
@@ -318,27 +376,29 @@ first three:
 - Every phase's own, more specific limitations are recorded in
   [PROGRESS.md](PROGRESS.md) as they were found.
 
-## 22. Future work
+## 23. Future work
 
 In roughly the order it would naturally continue:
 
-1. Wire Raft's `isConfirmedLeader()` into `ForgeServer`'s ownership
-   predicate and `ReplicationServer`/`ReplicationFollower`'s lifecycle for
-   real, automated data-plane failover — the single biggest gap between
-   "consensus exists" and "consensus controls the system."
-2. Persistent Raft state (mirroring the WAL's own crash-safety
+1. Persistent Raft state (mirroring the WAL's own crash-safety
    discipline), closing the crash-mid-term gap.
-3. A leveled compaction strategy, avoiding full-dataset rewrites.
-4. A network-queryable admin/metrics endpoint, following Phase 7's
+2. Extend Phase 15's fencing to a genuine multi-partition deployment (one
+   `RaftCluster`/`PartitionLeadership` per partition per node, not one
+   per node).
+3. Automate the rejoin resync path (a swappable store reference inside
+   `ForgeServer`, so `StaleReplicaRecovery` can run without an external
+   caller orchestrating the store swap).
+4. A leveled compaction strategy, avoiding full-dataset rewrites.
+5. A network-queryable admin/metrics endpoint, following Phase 7's
    precedent for additive wire-protocol extension.
-5. Session guarantees (read-your-writes) for clients that move between
+6. Session guarantees (read-your-writes) for clients that move between
    replicas.
-6. Multi-machine (not just multi-process, single-machine) benchmarking,
+7. Multi-machine (not just multi-process, single-machine) benchmarking,
    to properly separate FORGE's own behavior from this project's
    single-disk/single-CPU test environment — see BENCHMARKS.md §7.1's
    explicit caveat about what the current node-scaling numbers can't prove.
 
-## 23. Further reading
+## 24. Further reading
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — full component design
 - [docs/DESIGN.md](docs/DESIGN.md) — roadmap, phase contracts, and two

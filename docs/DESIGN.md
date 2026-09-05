@@ -55,7 +55,7 @@ finished contract.
 |---|---|
 | 1–6 (single node) | **Linearizable.** One process, one lock/serialization discipline (established explicitly in Phase 4 — not accidental), so every read reflects the most recently completed write. |
 | 7 (partitioned, no replication) | Still linearizable **per key** — each key lives on exactly one node. No cross-key transactions or atomicity are provided (consistent with ARCHITECTURE.md's non-goals), so "consistency" here never means multi-key consistency. |
-| 9 (replicated) | • Reads served by the **leader** of a partition: linearizable, *as long as the leader is genuinely still the leader* — this assumption breaks under split-brain, and **correction, recorded post-implementation: no fencing/epoch mechanism was actually built in Phase 9 or 10** to prevent it. `ForgeServer`'s ownership predicate is a static value set at construction, not something a Raft term or any other mechanism updates at runtime — so nothing in this codebase currently stops two nodes from both believing themselves leader of the same partition after a partition/split-brain event and both accepting writes. Phase 14's Raft terms are exactly the mechanism that *would* close this gap once genuinely wired into the data plane (a stale leader's lower term is rejected — see `RaftNodeTest` scenario 10) — but that wiring isn't done (PROGRESS.md's Phase 14 known limitations). This is a real, open gap, stated plainly rather than assumed closed. <br>• Reads served by a **follower**: **eventually consistent with bounded staleness.** The bound is not asserted, it's measured — replication lag (§3) is the metric that makes "how stale" a number instead of a hand-wave. |
+| 9 (replicated), updated by 15 | • Reads served by the **leader** of a partition: linearizable, *as long as the leader is genuinely, currently the authoritative one*. **Correction history**: Phase 9/10 built no fencing at all (`ForgeServer`'s ownership predicate was, and for pure partition ownership still is, a static value set at construction). Phase 15 closed the specific gap this row originally left open: `WriteAuthority`/`PartitionLeadership` now gate every `PUT`/`DELETE` on `RaftCluster.canServeAuthoritatively()` — a leader-lease check, not just `isConfirmedLeader()`, so a leader silently partitioned away self-fences within a bounded window even though it never receives a message telling it a new term exists (see `RaftNode.hasRecentQuorumContact`, docs/CONSISTENCY.md §5). **What remains true and disclosed**: the fencing window is bounded, not instantaneous (a write can still be wrongly accepted for up to roughly one lease duration after real contact is lost); this covers one Raft group per partition's replica set, not a full multi-partition deployment (PROGRESS.md's Phase 15 known limitations). <br>• Reads served by a **follower**: **eventually consistent with bounded staleness.** The bound is not asserted, it's measured — replication lag (§3) is the metric that makes "how stale" a number instead of a hand-wave. Reads are **not** fenced by Phase 15 — any node, including a demoted former leader, still answers `GET` from local data. |
 | 10 (recovery) | A node that just rejoined is **not** guaranteed caught-up the instant it's reachable again. Its state converges to the cluster's once catch-up completes. **Correction, recorded post-implementation**: this row originally implied a deliberate, documented choice about whether a catching-up node serves reads before it finishes. No such gating was actually built — `ConcurrentLsmKeyValueStore.get()` has no "still catching up" concept at all; a follower simply serves whatever it currently has, at any point during catch-up, which is the emergent behavior of there being no gate rather than a chosen tradeoff. A rejoining node is therefore readable immediately, at whatever staleness it happens to be at that moment — favoring availability by omission, not by design. Adding an explicit catch-up gate (e.g. refuse reads, or label them stale, until replication lag reaches zero) is a reasonable, currently-unimplemented follow-up. |
 
 ### The load-bearing invariant underneath all of it
@@ -129,11 +129,14 @@ questions. Below is the roadmap only — no code yet.
 | 11 | **Fault injection / chaos testing** | Fault-injection harness (process kill, network partition, slowdown, flapping) exercising Phases 8–10 together; correctness + failure-rate + lag measured under real injected faults (E10) |
 | 12 | Benchmarking suite | Full experiment sweep (E1–E11 as applicable) run and recorded in BENCHMARKS.md with methodology |
 | 13★ | Compaction & read optimization | Merge on-disk files, bloom filters, bound read amplification (E11 completed) |
-| 14★ | Automated failover / simplified consensus | Leader election on leader failure, without full Raft — **gated, see §9** |
+| 14★ | Automated failover / simplified consensus | **Correction, recorded post-implementation**: this row originally planned leader election *without* full Raft, gated behind §9's criteria. A later, explicit project directive superseded that gate and required genuine Raft (terms, RequestVote, AppendEntries, the paper's commit-safety rule) regardless — see PROGRESS.md's Phase 14 section for what was actually built and why "without full Raft" was not what shipped. |
+| 15 | Raft-driven data-plane failover & stale-leader fencing | Not in the original roadmap at all — added by a later, explicit directive once Phase 14 shipped Raft as a standalone control-plane mechanism with no data-plane wiring. Wires `RaftCluster.canServeAuthoritatively()` into `ForgeServer`'s write path (`WriteAuthority`/`PartitionLeadership`), makes cross-failover sequence numbering collision-proof (`SequenceEpochs`), and keeps replication following the current leader automatically (`ReplicationFollowerCoordinator`) with an explicit full-resync path for divergent rejoins (`StaleReplicaRecovery`). See PROGRESS.md's Phase 15 section for the complete design and its disclosed, bounded limits. |
 
 ★ = stretch phases, attempted only once 0–12 are solid. Nothing here is
 promised as "in scope" beyond what's actually built and tested — this table
-is a plan, not a changelog.
+is a plan, not a changelog. Phase 15 has no ★ — by the time it was
+directed, it was not a stretch goal but a required continuation of Phase
+14's own explicitly-disclosed gap.
 
 Phase 11 sits **after** replication (9) and failure detection (8) precisely
 because it needs both to exist to have something worth breaking — chaos
@@ -262,6 +265,14 @@ In other words: Raft/Paxos is a response to a demonstrated, measured
 shortcoming of the simpler mechanism, not a default upgrade — consistent
 with "do not claim a feature exists until it has actually been implemented
 and tested," applied here to *why* a feature would be added at all.
+
+**Correction, recorded post-implementation**: this gate was never
+actually exercised — the simpler heartbeat-triggered mechanism described
+above was never built, and no chaos-suite run against it ever happened.
+Real Raft (Phase 14) and its data-plane wiring (Phase 15) were both built
+directly, by explicit later project directive, superseding this gate
+rather than satisfying it. Recorded here rather than silently deleted, per
+this project's own stated discipline.
 
 ## 10. Core distributed-systems concepts, mapped to where they show up
 

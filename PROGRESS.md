@@ -2,12 +2,10 @@
 
 ## Current state
 
-**All 8 core phases (7-14) complete, plus final hardening, observability,
-and the full final documentation set (README, ARCHITECTURE, DESIGN,
-BENCHMARKS, FAILURE_MODEL, CONSISTENCY, OPERATIONS, DEMO,
-INTERVIEW_GUIDE, RESUME). 445/445 tests passing. The master directive's
-required work is complete; see "Next task" below for what remains
-optional/future.**
+**All 8 core phases (7-14) complete, Phase 15 (Raft-driven data-plane
+failover with stale-leader fencing) complete, plus final hardening,
+observability, and the full documentation set. 472/472 tests passing.
+See "Next task" below for what remains optional/future.**
 
 ## Completed work
 
@@ -2370,13 +2368,359 @@ finding this phase (the fencing/epoch gap) was a documentation accuracy
 issue, not a newly-introduced code defect — the gap itself has existed
 since Phase 9/10; what changed is that it's now honestly written down.
 
+## Phase 15: Raft-driven data-plane failover with stale-leader fencing (complete, 2026-09-05)
+
+### Why this phase exists
+
+Phase 14 built a real, correct, adversarially-tested Raft consensus
+implementation — but explicitly, honestly disclosed that it wasn't wired
+into anything: `RaftCluster.isConfirmedLeader()` existed as a signal
+nobody consumed. `ForgeServer`'s partition ownership was (and, for
+ownership specifically, still is) a static predicate; nothing about a
+Raft election changed what a node would actually do with a client write.
+This phase closes that gap: Raft's leader-election result now actually
+gates write acceptance, with a real, *bounded* fencing guarantee against
+the specific failure mode named "the difficult case" — a leader that is
+alive, was legitimately elected, and never receives a single message
+telling it anything is wrong.
+
+### How the control plane and data plane interact now — precisely
+
+Before this phase, there were three independent subsystems with no wiring
+between them: partitioning (Phase 7, static), replication (Phase 9,
+manually-paired `ReplicationServer`/`ReplicationFollower`), and Raft
+(Phase 14, a standalone election/log-replication state machine). Now:
+
+```
+RaftCluster (per replica set)
+   │  canServeAuthoritatively() -- confirmed leader AND recent quorum contact
+   ▼
+PartitionLeadership (implements WriteAuthority)
+   │  ratchets ConcurrentLsmKeyValueStore's sequence numbering into
+   │  the current term's band on first use each term
+   ▼
+ForgeServer / ConnectionHandler
+   │  fences PUT/DELETE only (GET is untouched — see docs/CONSISTENCY.md §5)
+   ▼
+client sees ERROR_NOT_LEADER (with a term/leader hint) or a normal ack
+
+Independently, on every node:
+RaftCluster.currentLeader()
+   ▼
+ReplicationFollowerCoordinator
+   │  keeps this node's ReplicationFollower pointed at whoever Raft says
+   │  currently leads; ratchets this node's own sequence band too before
+   │  reconnecting, so the two sides of a reconnect always agree on where
+   │  the new term's data starts
+   ▼
+ReplicationServer / ReplicationFollower (Phase 9, unmodified)
+```
+
+Two genuinely separate state machines (Raft's log of leadership no-ops;
+the KV data's own WAL) now agree on **one shared coordinate** — the
+current term, via `SequenceEpochs`' band arithmetic — without merging into
+one system. This is the precise, literal answer to "why is Raft not
+simply the existing replication system renamed": they still are, and
+remain, two different mechanisms; what's new this phase is the coordinate
+they now both respect.
+
+### The fencing mechanism, in full
+
+`RaftNode.isConfirmedLeader()` (Phase 14) only ever asks "did I win an
+election and get my own no-op acknowledged by a majority at some point."
+A leader that wins, gets confirmed, and is then silently partitioned away
+stays `isConfirmedLeader()` **forever** — nothing about that check ever
+looks at the passage of time. This is exactly the gap named "the
+difficult case": an old leader that is alive and never told about a
+newer term.
+
+**The fix — `RaftNode.hasRecentQuorumContact(Duration)` / `canServeAuthoritatively(Duration)`**:
+a leader tracks, per peer, the timestamp of its most recent *successful*
+AppendEntries acknowledgment in the *current* term (`lastAckTime`, reset
+empty on every election). `hasRecentQuorumContact(within)` counts self
+(always) plus every peer whose last ack is no older than `within`; if
+that count is a majority, the leader has proof of *recent*, not merely
+*historical*, majority support. `canServeAuthoritatively` is
+`isConfirmedLeader() && hasRecentQuorumContact(leaseDuration)`, both read
+from one `synchronized` method so a caller never observes a torn
+combination of the two. `leaseDuration` defaults to the cluster's own
+configured minimum election timeout — long enough that ordinary heartbeat
+jitter never trips it, short enough that a genuinely partitioned leader
+self-fences well before the survivors could legitimately have completed
+their own election (which itself needs at least one full election timeout
+to elapse first). This is a **local, this-node's-own-clock** computation,
+exactly like every other timeout in this codebase (`FailureDetector`,
+`RaftNode`'s own election timer) — no cross-node clock synchronization is
+assumed.
+
+**This is fencing with a disclosed, bounded staleness window, not an
+instantaneous guarantee.** A partitioned leader can still incorrectly
+*accept* a write for up to approximately `leaseDuration` after losing real
+contact — `StaleLeaderFencingIntegrationTest` and Scenario I both wait out
+exactly this window before asserting fencing has taken effect, rather than
+asserting it holds from instant zero. Stated plainly, not softened.
+
+### The sequence-number collision problem, and `SequenceEpochs`
+
+Phase 9's replication has no epoch concept — a flat, ever-increasing
+per-store sequence space. The scenario named in the mandate: leader A
+locally applies through sequence 100 but only replicates through 98
+before crashing; follower B, promoted to leader, would otherwise assign
+its own next write sequence **99** using the unmodified `put()` path —
+colliding with A's own, different, orphaned write that already used
+sequence 99.
+
+**Fix**: `SequenceEpochs.bandStart(term) = term * 1_000_000_000`. Every
+node that learns "the current leader is for term T" — whether becoming
+leader itself (`PartitionLeadership.canAcceptWrites()`) or following one
+(`ReplicationFollowerCoordinator`) — ratchets its own store's next
+sequence number to at least `bandStart(T)` via
+`ConcurrentLsmKeyValueStore.ensureNextSequenceNumberAtLeast` (now public;
+previously reachable only via the private `wal` field) **before**
+participating in that term's data flow. Because term is a value Raft
+already guarantees is agreed-upon, and bands never overlap, a write from
+a superseded term can never be mistaken for one from a newer term.
+**No change was needed to `WalRecord`, `ReplicationWireFormat`, or
+`applyReplicated`'s gap-detection logic** — the existing "reject anything
+at or below my current next-sequence-number" rule already does exactly
+the right thing once both sides of a reconnect have independently
+ratcheted into the same band. Rejected alternative: an explicit
+`(epoch, sequence)` pair threaded through the WAL/replication wire
+format — would achieve the same disambiguation but requires touching
+three frozen data formats instead of adding one derived-arithmetic layer
+on top of the existing one; not attempted given the band scheme is
+sufficient and non-invasive.
+
+**What the band scheme does *not* fix**: A's own locally-applied,
+never-replicated writes (sequences 99-100 in the example) are not erased
+from A's key-value data — only the WAL's future numbering moves on. A's
+local `GET` for a key those writes touched would still show them,
+indefinitely, if nothing else intervened. This is exactly why a rejoining
+former leader needs more than incremental catch-up — see below.
+
+### The rejoin problem, and `StaleReplicaRecovery`
+
+A rejoining node whose own data might be locally divergent (per the
+paragraph above) cannot safely resume via incremental `ReplicationFollower`
+catch-up — catching up only ever appends forward, it has no mechanism to
+retroactively correct an already-applied value from an abandoned term.
+`ReplicationFollowerCoordinator` detects this specific situation — **the
+first time (this process's lifetime) it ever considers following anyone**,
+its store already holds real data (`lastAppliedSequenceNumber() > 1`)
+whose implied term is behind the cluster's current one — and refuses
+incremental catch-up, flagging `needsFullResync()` instead of guessing.
+`StaleReplicaRecovery.resyncFromSnapshot` performs the actual repair:
+closes the stale store, deletes its entire data directory, and reloads it
+completely from a live `SnapshotServer` via Phase 10's unmodified
+`SnapshotClient` — discarding any local divergence entirely rather than
+attempting reconciliation.
+
+**A real design bug was found and fixed while building this**: the first
+version of this check fired on *every* term change for *any* node with
+real data, including an already-continuously-following plain follower
+that never originated a write and had zero actual divergence risk — this
+would have made a full resync mandatory after every single failover,
+defeating the point of incremental catch-up entirely. Root cause: the
+check conflated "my data implies an older term" (true for any follower
+that's simply been running a while) with "my data might be *divergent*"
+(true only for a node that might have originated writes of its own).
+Fixed by tracking `hasEverFollowedSuccessfully` — once a coordinator
+instance has proven itself a legitimate, continuously-correct follower,
+every later term change is treated as an ordinary live failover
+regardless of how many terms have passed; the resync question is only
+ever asked the first time, when local data of unknown provenance (most
+likely surviving a process restart) might exist. Found by the test
+`FailoverReplicationIntegrationTest` itself hanging/warning on the
+correct-follower case before this fix — see below.
+
+**Why this isn't automatic end-to-end**: `ReplicationFollowerCoordinator`
+detects the need for a resync but does not perform it — doing so would
+mean replacing a live `ForgeServer`'s `ConcurrentLsmKeyValueStore`
+instance out from under it, a bigger structural change (a mutable,
+swappable store reference) than this phase's scope. A caller invokes
+`StaleReplicaRecovery` explicitly — proven end-to-end in
+`FailoverReplicationIntegrationTest`'s rejoin section.
+
+### Consistency model — the ten questions, answered precisely
+
+1. **When is a write accepted?** When the receiving node's `ForgeServer`
+   both owns the key's partition (Phase 7, static) *and* its
+   `WriteAuthority.canAcceptWrites()` — backed by `PartitionLeadership`,
+   ultimately `RaftCluster.canServeAuthoritatively()` — returns true, at
+   the moment the request is processed.
+2. **Which node is authoritative?** Whichever node Raft currently,
+   recently (within the lease) confirms as leader of that partition's
+   replica set.
+3. **Does the leader need follower acknowledgement to accept a write?**
+   No. Unchanged from Phase 9.
+4. **Is replication still asynchronous?** Yes — unchanged, deliberately.
+   Not silently upgraded to synchronous; see docs/DESIGN.md §2.
+5. **What writes can be lost after a leader crash?** Exactly what Phase
+   9/11 already disclosed: any write acknowledged locally but never
+   forwarded to (or received by) any follower before the crash. This
+   phase does not change that — it bounds how much *worse* it can get by
+   fencing the old leader from accepting *more* such writes once its
+   lease expires.
+6. **What writes are considered committed?** Raft's own log entries (the
+   per-election no-ops) are committed in the textbook Raft sense (§5.4.2,
+   `recomputeCommitIndex`). **KV writes are not tracked by Raft's commit
+   mechanism at all** — they're still Phase 9's async, best-effort
+   replication. Conflating the two would be exactly the kind of
+   fabricated guarantee this project's honesty requirements forbid; they
+   are deliberately named separately here.
+7. **Can a minority partition accept writes?** Not for longer than
+   `leaseDuration` after losing real quorum contact — proved directly in
+   Scenario I and `StaleLeaderFencingIntegrationTest`.
+8. **What happens when the old leader returns?** It discovers the higher
+   term (immediately, if reachable; via the lease/step-down path if it
+   was still alive throughout), steps down to FOLLOWER, and — if its own
+   data implies an older term than the cluster's current one — is flagged
+   for a full snapshot resync rather than trusted incrementally.
+9. **What happens to uncommitted entries?** Raft's own uncommitted log
+   entries are handled per Figure 2 (unchanged from Phase 14, e.g.
+   scenario 7's log-inconsistency backoff). A former leader's *KV* writes
+   that were never replicated are simply left behind in its own local
+   state until (if ever) a resync overwrites them.
+10. **What does Raft provide versus the existing async data replication?**
+    Raft provides correct, majority-quorum-backed answers to exactly one
+    question — "who leads, right now, provably" — and nothing about *how
+    data moves*. Phase 9 still owns all data movement, unmodified.
+
+### Implementation
+
+New: `ProtocolConstants.ERROR_NOT_LEADER` (forge-common, additive);
+`ConcurrentLsmKeyValueStore.ensureNextSequenceNumberAtLeast` made public
+(forge-storage, previously private-via-`wal`); `WriteAuthority` interface
++ new additive `ForgeServer`/`ConnectionHandler` constructor overloads
+(forge-server); `com.forge.cluster.leadership` package — `SequenceEpochs`,
+`PartitionLeadership`, `ReplicationFollowerCoordinator`
+(forge-cluster); `com.forge.cluster.recovery.StaleReplicaRecovery`
+(forge-cluster); `RaftNode.hasRecentQuorumContact`/`canServeAuthoritatively`
+and `RaftCluster.canServeAuthoritatively`/new lease-duration constructor
+overload (forge-cluster, Phase 14 code — a justified, minimal, documented
+touch of frozen code: Phase 15's own assigned deliverable, closing the
+Figure-8-adjacent "partitioned leader never learns" gap Phase 14 explicitly
+disclosed as open, is exactly the kind of "later phase genuinely requires
+a compatibility change" case the master directive anticipated);
+`PartitionedForgeClient` gained one-hop `ERROR_NOT_LEADER` redirect +
+hint parsing.
+
+### Bugs found and fixed
+
+1. **`ReplicationFollowerCoordinator`'s resync-detection check was too
+   conservative in two different ways**, found via
+   `FailoverReplicationIntegrationTest`: first, `lastApplied > 1` wasn't
+   guarded against a brand-new node's default state, so *every* first-ever
+   catch-up was flagged as needing a resync (`0 < term` is always true).
+   Fixed by requiring `lastApplied > 1` (real prior data) before
+   considering it. Second, even after that fix, *every* term change for
+   *any* node with real data was flagged — including an already-following,
+   never-diverged plain follower — which would have made a full resync
+   mandatory on every ordinary failover. Fixed via `hasEverFollowedSuccessfully`
+   (see above). Both were caught by the same integration test failing/warning
+   in a way that made the actual (over-broad) logic obvious on inspection.
+2. **A test bug (not production code)**: `FailoverReplicationIntegrationTest`'s
+   first draft pointed `StaleReplicaRecovery.resyncFromSnapshot` at a
+   `ReplicationServer`'s port instead of a `SnapshotServer`'s — two
+   independent wire protocols expecting different handshakes — causing an
+   indefinite hang (each side blocked reading bytes the other was never
+   going to send). Found via `jstack`, showing the main thread blocked in
+   `SnapshotClient.fetchAndLoad`'s `readLong()`. Fixed by actually starting
+   a `SnapshotServer` for the new leader in the test. Recorded as a known
+   limitation below: neither `SnapshotClient` nor `ReplicationFollower`'s
+   initial handshake read has a socket-level timeout, so a genuine
+   protocol mismatch or a truly stuck peer hangs the caller indefinitely
+   rather than failing fast — pre-existing since Phase 9/10, not
+   introduced this phase, not fixed this phase.
+3. **`ChaosScenarioTest` Scenario K's first draft tried to elect a third
+   leader from 1 of an original 3 nodes** — mathematically impossible (1
+   is not a majority of 3), and the test correctly hung waiting for
+   something that must never happen. This was the test's own design bug,
+   not a product bug: rewritten to use a 5-node cluster, where two
+   successive crashes still leave 3 survivors (a majority of 5). The
+   original failure is recorded in the scenario's own Javadoc as a useful
+   design note.
+
+### Tests
+
+`mvn clean test` from the repo root — **472/472 tests pass, 0 failures, 0
+errors** (445 from final hardening + 27 new: 4 `RaftNode` lease scenarios,
+6 `SequenceEpochs` arithmetic, 4 `PartitionLeadership`, 3 `WriteAuthority`
+fencing in `ForgeServerTest`, 3 `ERROR_NOT_LEADER` redirect in
+`PartitionedForgeClientTest`, 2 full-stack integration tests
+(`StaleLeaderFencingIntegrationTest`, `FailoverReplicationIntegrationTest`),
+6 new chaos scenarios G-L):
+
+```
+forge-common  : 42   (unchanged)
+forge-storage : 257  (unchanged since final hardening)
+forge-server  : 17   (+3 WriteAuthority fencing tests)
+forge-client  : 11   (unchanged)
+forge-cluster : 113  (+4 RaftNode lease, +6 SequenceEpochs, +4 PartitionLeadership,
+                       +3 PartitionedForgeClient redirect, +2 integration tests,
+                       +6 chaos scenarios G-L)
+forge-bench   : 14   (unchanged — FailoverBenchmarkRunner has no unit tests
+                       of its own, exercised by actually running it)
+forge-tests   : 18   (unchanged)
+BUILD SUCCESS
+```
+
+The mandatory test (`StaleLeaderFencingIntegrationTest`) proves, over real
+sockets with a real `FaultInjectingTcpProxy`-simulated bidirectional
+partition (never `close()` — A's `RaftCluster` object stays alive and
+ticking throughout): A leads in term T; A is genuinely, bidirectionally
+partitioned from B and C; B/C elect a new leader at a strictly higher
+term using their own intact majority; A's own lease expires from the
+passage of time alone (never receiving a single contradicting message)
+and it self-fences; a client write to A is rejected with
+`ERROR_NOT_LEADER`; the new leader remains authoritative throughout; the
+partition heals; A discovers the higher term and steps down to FOLLOWER;
+A still cannot serve writes, immediately after healing or shortly after.
+Run 5 times consecutively with no flakiness observed.
+
+### Benchmarks
+
+Real, measured failover timing (election time, leadership-transition
+time, time to first successful write after a leader crash), 5 repeats —
+see BENCHMARKS.md §9 (E17). Mean election time ~0.35s, consistent with
+the configured randomized election timeout window; the data plane resumes
+serving writes within single-digit milliseconds of the control plane
+confirming a leader.
+
+### Known limitations (Phase 15)
+
+- **Single-partition/single-replica-set scope.** `PartitionLeadership`,
+  `ReplicationFollowerCoordinator`, and every test here model one Raft
+  group controlling one partition's replica set. Multi-partition
+  deployments (one `RaftCluster` per partition per node) are a natural,
+  larger extension — the abstractions here don't need to change shape,
+  just be instantiated once per partition instead of once per node.
+- **`ReplicationServer` runs unconditionally on every node**, not
+  started/stopped based on current leadership — a non-leader's server
+  simply has nothing new to serve once fencing prevents it from accepting
+  writes; harmless, but not the most resource-minimal design.
+- **Full resync is detected but not auto-performed** — see "why this
+  isn't automatic end-to-end" above; a caller must invoke
+  `StaleReplicaRecovery` explicitly.
+- **No socket-level read timeout on `SnapshotClient`/`ReplicationFollower`'s
+  initial handshake** — a genuinely stuck or wrong-protocol peer hangs the
+  caller indefinitely rather than failing fast. Pre-existing since Phase
+  9/10; discovered (as a test bug, not a production incident) while
+  building this phase; not fixed here.
+- **No election-driven wiring for GET** — reads remain deliberately
+  unfenced on every node, including a demoted former leader; see
+  docs/CONSISTENCY.md §5's full table.
+- **Every Phase 14 limitation still applies unchanged**: no persistent
+  Raft state (a node that crashes and restarts mid-term could in
+  principle vote twice in that term); no cluster membership changes to a
+  live Raft group.
+- **The split-brain gap is closed only to the extent described above** —
+  see the final report accompanying this phase's completion message for
+  the precise, honest answer to "is it actually closed."
+
 ## Next task
 
-**Optional final UI**: explicitly gated on the core being complete and
-undelayed by the master directive — deprioritized in favor of finishing
-the required final documentation, demo, and report on schedule; not
-attempted. **Final report**: see the message accompanying this session's
-completion for the full 21-item report the master directive specifies.
+**Optional final UI**: still explicitly gated on the core being complete
+and undelayed, per the master directive's own rule — not attempted.
 This file (PROGRESS.md) and the documents listed in README §23 are the
-complete, current state of the project — there is no further "next task"
-pending from the master directive's phase list.
+complete, current state of the project.

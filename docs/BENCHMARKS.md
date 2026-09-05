@@ -29,6 +29,7 @@
 | E13 | Replication overhead (leader-local PUT latency vs. follower count) | Phase 9 | **Run — Phase 12, §7 below** |
 | E15 | Replica catch-up time vs. backlog size | Phase 9–10 | **Run — Phase 12, §7 below** |
 | E16 | Compaction read/write amplification | Phase 13 | **Run — Phase 13, §8 below** |
+| E17 | Failover timing (election, leadership transition, time to first write) | Phase 15 | **Run — Phase 15, §9 below** |
 
 **E6/E7/E8 note**: none of these were run this phase. E6 (partition/rebalance
 cost) and E8 (replication ack policy: async vs. sync) have no dedicated
@@ -636,3 +637,70 @@ overwritten space, reduces file count, and measurably speeds up misses) is
 real and directly measured; the specific byte counts and the 3.4× latency
 figure are particular to this workload's size and would not be quoted as
 production numbers at a different scale.
+
+## §9 Phase 15 — Failover timing (E17)
+
+**Method**: a real 3-node cluster (`RaftCluster` + `ForgeServer` +
+`PartitionLeadership`, the exact same stack `StaleLeaderFencingIntegrationTest`/
+`FailoverReplicationIntegrationTest` use for correctness) is built with
+node A given a short election timeout (`[50, 80]ms`) so it deterministically
+wins the first election, and B/C given a longer one (`[150, 300]ms`).
+A confirms leadership, accepts one warm-up write, and is then closed
+outright (`ForgeServer.close()` + `RaftCluster.close()` — a clean crash,
+not a partition). Three `System.nanoTime()`-timed instants are recorded
+from the moment of the crash: when a survivor becomes a confirmed leader
+("election time"), when that leader's own `PartitionLeadership.canAcceptWrites()`
+first returns true ("leadership transition time" — in this implementation
+these two are nearly identical, since confirmation already requires a
+majority ack, see below), and when a real client `PUT` through the new
+leader actually completes ("time to first successful write"). 5 repeats.
+Reproduce with:
+```
+mvn install -DskipTests
+mvn -pl forge-bench exec:java -Dexec.mainClass=com.forge.bench.FailoverBenchmarkRunner
+```
+Raw data: `forge-bench/results/phase15-failover-2026-09-05T05-52-50.890086Z.csv`.
+
+| Run | Election time (s) | Leadership transition (s) | Time to first write (s) |
+|---:|---:|---:|---:|
+| 1 | 0.249 | 0.251 | 0.257 |
+| 2 | 0.206 | 0.210 | 0.215 |
+| 3 | 0.515 | 0.517 | 0.524 |
+| 4 | 0.484 | 0.486 | 0.489 |
+| 5 | 0.276 | 0.278 | 0.283 |
+| **mean** | **0.346** | **0.348** | **0.354** |
+
+**Measured result, plainly stated**: election time ranges ~0.21-0.52s
+across 5 runs, averaging ~0.35s — consistent with, and bounded by, the
+survivors' own configured randomized election timeout window
+(`[150, 300]ms`) plus the time for the winning RequestVote round-trip and
+a majority AppendEntries ack to complete. The spread run-to-run is exactly
+what a *randomized* election timeout should produce (§14's `RaftNode`
+Javadoc on why randomization exists) — it is not noise to be explained
+away, it's the mechanism working as designed.
+
+**Derived metric**: leadership transition time is only ~2-4ms after
+election time, and time-to-first-write only ~5-7ms after that — both
+small increments on top of the dominant election-time cost, matching
+expectations: becoming "confirmed" only needs the no-op's majority ack
+(which typically arrives alongside or immediately after the vote that won
+the election), and a `PUT`'s own added cost is just one WAL fsync
+(~4ms, §2) plus network round trips.
+
+**What this does *not* measure, stated explicitly** (per this project's
+"failure detection time" framing): this system has **no separate
+failure-detection step** feeding into Raft failover — Raft's own election
+timeout is the only mechanism that notices a leader is gone. Phase 8's
+`FailureDetector` exists but is not wired into this decision. So there is
+only one number here (election time), not two — reporting an additional
+"detection time" would imply a second mechanism that does not exist in
+this codebase.
+
+**What this is not**: a production SLA or a claim about behavior under
+real workload/network conditions — this is 3 processes on one machine,
+loopback networking, no concurrent client load during the failover window.
+The pattern (failover completes within roughly one configured election
+timeout window, and the data plane resumes serving writes within
+single-digit milliseconds of the control plane confirming a leader) is
+real and measured; the specific numbers would differ on a real multi-machine
+deployment or under load.
