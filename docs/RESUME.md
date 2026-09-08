@@ -31,7 +31,7 @@ is implemented directly.
   with MemTable/SSTable flush and full compaction, consistent-hash
   partitioning with virtual nodes, asynchronous leader-follower
   replication, and Raft consensus wired into real, automated, fenced
-  data-plane failover — 472 automated tests across 7 Maven modules, 0
+  data-plane failover — 493 automated tests across 7 Maven modules, 0
   failures.
 - Built and wired a real Raft consensus subsystem (terms, majority-vote
   election, AppendEntries log replication, the paper's Figure 8
@@ -69,7 +69,7 @@ is implemented directly.
   LSM storage engine, compaction, Bloom filters, consistent hashing,
   leader-follower replication, crash recovery, chaos/fault-injection
   testing, and Raft consensus driving real automated, fenced failover.
-- 472 automated tests (JUnit 5) across storage, networking, partitioning,
+- 493 automated tests (JUnit 5) across storage, networking, partitioning,
   replication, recovery, chaos, and consensus; real multi-process/real-socket
   integration tests, not simulated in-process shortcuts.
 - Implemented and benchmarked LSM compaction and Bloom filters: 90%
@@ -80,6 +80,12 @@ is implemented directly.
   network-partition, and crash-failover tests.
 - Used Java 21 virtual threads for connection handling and RPC dispatch;
   Maven multi-module architecture with clean module boundaries.
+- Ran a self-directed engineering audit after the core was feature-complete,
+  implementing only what materially improved correctness or
+  demonstrability (durable Raft state closing a paper-cited safety gap;
+  a real multi-process cluster launcher) while explicitly deferring five
+  other candidate items with stated reasons, instead of adding features
+  to inflate scope.
 
 ## What's deliberately *not* claimed here
 
@@ -89,6 +95,8 @@ measured, no "production-grade," "enterprise-ready," "linearizable," or
 docs/CONSISTENCY.md and docs/FAILURE_MODEL.md. Fencing between the
 control and data plane exists and is proven, but with a disclosed,
 bounded staleness window (not instantaneous) and single-partition scope;
-Raft still keeps no persistent state. These are part of the honest story
-this project tells about itself, not something to omit from a resume
-conversation if asked directly.
+Raft persists `currentTerm`/`votedFor` but still not its log, which has a
+real, disclosed liveness consequence in a bare-minimum-quorum (2-node)
+cluster (PROGRESS.md's audit section has the full story). These are part
+of the honest story this project tells about itself, not something to
+omit from a resume conversation if asked directly.

@@ -45,11 +45,18 @@ precise reasoning behind treating the two differently).
   write. There is no synchronous-replication mode to opt into (E13 in
   BENCHMARKS.md measures the real cost this asynchronicity is trading
   against). This is Phase 11 Scenario A's exact, tested subject.
-- **Raft consensus (Phase 14) has no persistent state.** A node that
-  crashes and restarts mid-term rejoins as a brand-new participant at term
-  0 — safe for liveness, but a real (if narrow) gap relative to the Raft
-  paper's crash-safety guarantee for `votedFor`. See `RaftNode`'s class
-  Javadoc for the precise window this affects.
+- **Raft consensus persists `currentTerm`/`votedFor` (post-Phase-15
+  audit) but still not the log.** A restarted node can no longer
+  double-vote in a term it already voted in — the Raft paper's core
+  crash-safety concern for `votedFor` is closed. Its log, however, is
+  always empty after a restart (deliberately not persisted — it only ever
+  holds disposable no-op leadership markers), which correctly makes peers
+  with a non-empty log refuse to elect it, *independent of term*. In a
+  cluster no larger than the bare minimum quorum (2 nodes), this is a
+  genuine, disclosed **liveness** gap: neither the restarted node nor its
+  lone surviving peer can ever become leader again. Not fatal at 3+ nodes
+  — the surviving majority elects without it. See `RaftPersistentState`'s
+  class Javadoc for the full reasoning.
 - **No Byzantine fault tolerance** (§1).
 - **No authentication, authorization, or transport encryption.** Every TCP
   connection is trusted. Not a distributed-systems concept this project

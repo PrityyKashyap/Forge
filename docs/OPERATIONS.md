@@ -74,7 +74,10 @@ running multi-node FORGE cluster's behavior is:
    `ReplicationFollower`, `FailureDetector`/`HeartbeatService`, `RaftCluster`)
    logs role transitions, connections, and elections via SLF4J/Logback at
    INFO level. Running each node with its own visible console is the
-   most direct way to watch a demo unfold in real time.
+   most direct way to watch a demo unfold in real time — post-Phase-15
+   audit addition: `com.forge.cluster.launcher.ClusterNodeMain` (docs/DEMO.md
+   §13) is a real CLI for actually doing this with genuinely separate
+   processes, not just test code.
 2. **The `status` subcommand** above, run against a stopped node's
    directory, for storage-engine-level inspection.
 3. **`forge-bench`'s runners** for throughput/latency, which measure by

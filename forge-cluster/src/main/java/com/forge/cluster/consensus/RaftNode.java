@@ -2,6 +2,7 @@ package com.forge.cluster.consensus;
 
 import com.forge.cluster.NodeId;
 
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -48,26 +49,34 @@ import java.util.Set;
  * production, {@link RaftCluster}) actually transmits and feeds responses
  * back through {@link #handleRequestVoteResponse}/{@link #handleAppendEntriesResponse}.
  *
- * <h2>Honest, explicitly disclosed limitation: no persistent storage</h2>
+ * <h2>Persistent state (post-Phase-15 audit addition) — and what's still deliberately not persisted</h2>
  * The Raft paper requires {@code currentTerm}, {@code votedFor}, and the
  * log to be persisted to stable storage <em>before responding to RPCs</em>,
  * so that a crashed-and-restarted node can never violate the "at most one
  * leader per term" safety property by forgetting a vote it already cast.
- * This implementation keeps all of that in memory only. A node that
- * crashes and restarts rejoins as a brand-new participant at term 0 with an
- * empty log — safe with respect to <em>liveness</em> (the cluster still
- * makes progress) but a real, disclosed gap relative to the paper's
- * crash-safety guarantee: in a narrow, specific window (this node voted for
- * a candidate, crashed before that vote could matter, and restarts inside
- * the very same term before that election concludes) a restarted node
- * could in principle cast a second vote in a term it already voted in.
- * Building durable Raft state (mirroring the WAL's temp-file/force/rename
- * discipline) is a natural, larger follow-up — see PROGRESS.md's Phase 14
- * known limitations. This implementation's correctness claims are scoped
- * to "no node crash-restarts mid-term," which every adversarial test that
- * exercises crash/restart respects explicitly by restarting nodes only
- * with a fresh {@code RaftNode} (matching what actually happens today) —
- * never claiming crash-restart safety that isn't actually implemented.
+ * {@code currentTerm}/{@code votedFor} now are: every mutation of either
+ * field calls {@link RaftPersistenceListener#onPersistentStateChanged}
+ * <em>before</em> the in-memory fields themselves change, and a caller
+ * seeds a restarted node's initial values from {@link RaftPersistentState}
+ * (see {@code RaftCluster}'s persistence-enabled constructor). If
+ * persistence fails, the in-memory fields are left completely untouched and
+ * the failure propagates like a dropped RPC — this node simply doesn't
+ * grant the vote / doesn't advance its term this round, never fabricating
+ * durability it doesn't have.
+ * <p>The log is <b>deliberately still not persisted</b> — see {@link
+ * RaftPersistentState}'s class Javadoc for exactly why that's safe here
+ * (this log only ever carries disposable no-op leadership markers, never
+ * real data) and not merely deferred out of laziness. A node that crashes
+ * and restarts still rejoins with an empty log but now with its correct,
+ * durable {@code currentTerm}/{@code votedFor} — the "at most one vote per
+ * term, even across a crash" safety property is closed; as a
+ * <em>follower</em>, the log's own loss on restart costs nothing beyond
+ * what the existing {@code nextIndex} back-off already handles for any
+ * lagging follower. As a would-be <em>candidate</em>, though, the empty
+ * log correctly (per Raft's own up-to-date-log safety rule) can never win
+ * a vote against a peer with a non-empty log — see {@link
+ * RaftPersistentState}'s Javadoc for the real, disclosed liveness
+ * consequence this has in a bare-minimum-quorum (2-node) cluster.
  *
  * <p>Thread-safe: every public method is {@code synchronized} — control-plane
  * traffic is low-volume, so one lock is simple and sufficient, same
@@ -82,10 +91,11 @@ public final class RaftNode {
     private final Duration electionTimeoutMax;
     private final Duration heartbeatInterval;
     private final Random random;
+    private final RaftPersistenceListener persistenceListener;
 
-    // "Persistent" state per the paper — kept in memory only; see class Javadoc.
-    private long currentTerm = 0;
-    private NodeId votedFor = null;
+    // Persistent state per the paper (currentTerm/votedFor only — see class Javadoc for the log).
+    private long currentTerm;
+    private NodeId votedFor;
     private final List<LogEntry> log = new ArrayList<>();
 
     // Volatile state on all servers.
@@ -115,6 +125,24 @@ public final class RaftNode {
 
     public RaftNode(NodeId selfId, Set<NodeId> peers, Clock clock, Duration electionTimeoutMin,
             Duration electionTimeoutMax, Duration heartbeatInterval, Random random) {
+        this(selfId, peers, clock, electionTimeoutMin, electionTimeoutMax, heartbeatInterval, random,
+                RaftPersistenceListener.NONE, 0L, null);
+    }
+
+    /**
+     * As the other constructor, plus persistence wiring: {@code
+     * persistenceListener} is invoked synchronously on every future
+     * {@code currentTerm}/{@code votedFor} change (see class Javadoc), and
+     * {@code initialTerm}/{@code initialVotedFor} seed this node's starting
+     * values — a caller restarting a real node passes what {@link
+     * RaftPersistentState#load} returned; a caller with nothing durable yet
+     * (or not wiring persistence at all, like every test) passes
+     * {@code (RaftPersistenceListener.NONE, 0L, null)}, exactly the other
+     * constructor's behavior.
+     */
+    public RaftNode(NodeId selfId, Set<NodeId> peers, Clock clock, Duration electionTimeoutMin,
+            Duration electionTimeoutMax, Duration heartbeatInterval, Random random,
+            RaftPersistenceListener persistenceListener, long initialTerm, NodeId initialVotedFor) {
         this.selfId = Objects.requireNonNull(selfId, "selfId must not be null");
         this.peers = Set.copyOf(Objects.requireNonNull(peers, "peers must not be null"));
         if (peers.contains(selfId)) {
@@ -128,6 +156,9 @@ public final class RaftNode {
         }
         this.heartbeatInterval = requirePositive(heartbeatInterval, "heartbeatInterval");
         this.random = Objects.requireNonNull(random, "random must not be null");
+        this.persistenceListener = Objects.requireNonNull(persistenceListener, "persistenceListener must not be null");
+        this.currentTerm = initialTerm;
+        this.votedFor = initialVotedFor;
 
         Instant now = clock.instant();
         this.lastElectionResetTime = now;
@@ -156,7 +187,7 @@ public final class RaftNode {
      * with no qualifying reset (a granted vote, or a valid AppendEntries
      * from a current-term leader).
      */
-    public synchronized List<RaftAction> tick() {
+    public synchronized List<RaftAction> tick() throws IOException {
         Instant now = clock.instant();
         if (role == RaftRole.LEADER) {
             if (Duration.between(lastHeartbeatSentTime, now).compareTo(heartbeatInterval) >= 0) {
@@ -171,8 +202,10 @@ public final class RaftNode {
         return List.of();
     }
 
-    private List<RaftAction> startElection(Instant now) {
-        currentTerm++;
+    private List<RaftAction> startElection(Instant now) throws IOException {
+        long newTerm = currentTerm + 1;
+        persistenceListener.onPersistentStateChanged(newTerm, selfId);
+        currentTerm = newTerm;
         role = RaftRole.CANDIDATE;
         votedFor = selfId;
         currentLeader = null;
@@ -253,7 +286,7 @@ public final class RaftNode {
     // =====================================================================
 
     /** Handles an incoming RequestVote RPC — Figure 2's rules, exactly. */
-    public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
+    public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) throws IOException {
         Objects.requireNonNull(request, "request must not be null");
         if (request.term() > currentTerm) {
             stepDownToFollower(request.term());
@@ -265,6 +298,7 @@ public final class RaftNode {
         boolean canVote = votedFor == null || votedFor.equals(request.candidateId());
         boolean upToDate = isAtLeastAsUpToDate(request.lastLogIndex(), request.lastLogTerm());
         if (canVote && upToDate) {
+            persistenceListener.onPersistentStateChanged(currentTerm, request.candidateId());
             votedFor = request.candidateId();
             resetElectionTimer(clock.instant());
             return new RequestVoteResponse(currentTerm, true);
@@ -281,7 +315,7 @@ public final class RaftNode {
     }
 
     /** Handles an incoming AppendEntries RPC (heartbeat when {@code entries} is empty) — Figure 2's rules, exactly. */
-    public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+    public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) throws IOException {
         Objects.requireNonNull(request, "request must not be null");
         if (request.term() < currentTerm) {
             return new AppendEntriesResponse(currentTerm, false, 0);
@@ -317,7 +351,8 @@ public final class RaftNode {
         return new AppendEntriesResponse(currentTerm, true, index);
     }
 
-    private void stepDownToFollower(long newTerm) {
+    private void stepDownToFollower(long newTerm) throws IOException {
+        persistenceListener.onPersistentStateChanged(newTerm, null);
         currentTerm = newTerm;
         role = RaftRole.FOLLOWER;
         votedFor = null;
@@ -333,7 +368,8 @@ public final class RaftNode {
     // =====================================================================
 
     /** Handles a RequestVote response from {@code from}; may return a fresh round of heartbeats if this vote just won the election. */
-    public synchronized List<RaftAction> handleRequestVoteResponse(NodeId from, RequestVoteResponse response) {
+    public synchronized List<RaftAction> handleRequestVoteResponse(NodeId from, RequestVoteResponse response)
+            throws IOException {
         Objects.requireNonNull(from, "from must not be null");
         Objects.requireNonNull(response, "response must not be null");
         if (response.term() > currentTerm) {
@@ -359,7 +395,7 @@ public final class RaftNode {
      * request can't corrupt {@code nextIndex}/{@code matchIndex} bookkeeping.
      */
     public synchronized void handleAppendEntriesResponse(NodeId from, AppendEntriesRequest request,
-            AppendEntriesResponse response) {
+            AppendEntriesResponse response) throws IOException {
         Objects.requireNonNull(from, "from must not be null");
         Objects.requireNonNull(request, "request must not be null");
         Objects.requireNonNull(response, "response must not be null");

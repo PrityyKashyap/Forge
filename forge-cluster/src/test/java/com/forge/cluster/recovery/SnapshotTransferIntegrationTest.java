@@ -132,6 +132,33 @@ class SnapshotTransferIntegrationTest {
     }
 
     @Test
+    @Timeout(15)
+    void aSilentPeerTimesOutInsteadOfHangingForever(@TempDir Path baseDir) throws Exception {
+        // Post-Phase-15 audit fix: a peer that accepts the connection but never sends a
+        // byte (wrong port, wrong protocol, or genuinely stuck) must fail fast, not hang
+        // this JUnit @Timeout-only case that actually caused a real 4+-minute test hang
+        // during Phase 15 development (see PROGRESS.md / SnapshotClient's class Javadoc).
+        try (ServerSocket rawServer = new ServerSocket(0)) {
+            Thread serverThread = Thread.ofPlatform().start(() -> {
+                try (Socket socket = rawServer.accept()) {
+                    Thread.sleep(10_000); // hold the connection open, sending nothing
+                } catch (IOException | InterruptedException ignored) {
+                    // expected once the client side's read times out and it closes
+                }
+            });
+
+            try (ConcurrentLsmKeyValueStore destStore = new ConcurrentLsmKeyValueStore(baseDir.resolve("dest"))) {
+                Instant start = Instant.now();
+                assertThrows(IOException.class, () -> SnapshotClient.fetchAndLoad(
+                        "localhost", rawServer.getLocalPort(), destStore, Duration.ofMillis(500)));
+                assertTrue(Duration.between(start, Instant.now()).compareTo(Duration.ofSeconds(5)) < 0,
+                        "a silent peer must fail fast via the configured timeout, not hang");
+            }
+            serverThread.join(15_000);
+        }
+    }
+
+    @Test
     @Timeout(30)
     void aBootstrappedNodeResumesReplicationSeamlesslyWithNoGapAndNoDuplication(@TempDir Path baseDir) throws Exception {
         Path destDir = baseDir.resolve("dest");

@@ -50,7 +50,7 @@ class RaftNodeTest {
     // Scenario 1: an election with a majority of votes wins outright
     // =====================================================================
     @Test
-    void scenario1_electionWithMajorityVotesBecomesLeader() {
+    void scenario1_electionWithMajorityVotesBecomesLeader() throws Exception {
         NodeId self = new NodeId("n1");
         NodeId peer1 = new NodeId("n2");
         NodeId peer2 = new NodeId("n3");
@@ -83,7 +83,7 @@ class RaftNodeTest {
     // Scenario 2: a split vote (no majority) forces a new election at a higher term
     // =====================================================================
     @Test
-    void scenario2_splitVoteTriggersNewElectionAtHigherTerm() {
+    void scenario2_splitVoteTriggersNewElectionAtHigherTerm() throws Exception {
         NodeId self = new NodeId("n1");
         Set<NodeId> peers = Set.of(new NodeId("n2"), new NodeId("n3"), new NodeId("n4"), new NodeId("n5"));
         MutableClock clock = new MutableClock(Instant.EPOCH);
@@ -111,7 +111,7 @@ class RaftNodeTest {
     // Scenario 3: a stale-term RequestVote is rejected and reports the true current term
     // =====================================================================
     @Test
-    void scenario3_staleTermRequestVoteIsRejected() {
+    void scenario3_staleTermRequestVoteIsRejected() throws Exception {
         NodeId self = new NodeId("n1");
         NodeId leader = new NodeId("leader");
         MutableClock clock = new MutableClock(Instant.EPOCH);
@@ -130,7 +130,7 @@ class RaftNodeTest {
     // Scenario 4: at most one vote is granted per term
     // =====================================================================
     @Test
-    void scenario4_atMostOneVotePerTerm() {
+    void scenario4_atMostOneVotePerTerm() throws Exception {
         NodeId self = new NodeId("n1");
         NodeId candidateA = new NodeId("a");
         NodeId candidateB = new NodeId("b");
@@ -152,7 +152,7 @@ class RaftNodeTest {
     // Scenario 5: a higher term observed anywhere forces an immediate step-down
     // =====================================================================
     @Test
-    void scenario5_higherTermAlwaysForcesStepDownToFollower() {
+    void scenario5_higherTermAlwaysForcesStepDownToFollower() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId peer = new NodeId("n2");
@@ -182,7 +182,7 @@ class RaftNodeTest {
     // Scenario 6: log-inconsistent AppendEntries is rejected; leader backs off nextIndex and retries
     // =====================================================================
     @Test
-    void scenario6_logInconsistencyIsRejectedAndLeaderBacksOffNextIndex() {
+    void scenario6_logInconsistencyIsRejectedAndLeaderBacksOffNextIndex() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId follower = new NodeId("follower");
         NodeId oldLeader = new NodeId("old-leader");
@@ -226,7 +226,7 @@ class RaftNodeTest {
     // Scenario 7: Figure 8 safety — an entry from an older term is never committed by direct majority count alone
     // =====================================================================
     @Test
-    void scenario7_oldTermEntryNeverCommittedByDirectMajorityCountAlone() {
+    void scenario7_oldTermEntryNeverCommittedByDirectMajorityCountAlone() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId peer1 = new NodeId("n2");
@@ -278,7 +278,7 @@ class RaftNodeTest {
     // Scenario 8: a candidate steps down when a legitimate same-term leader is discovered
     // =====================================================================
     @Test
-    void scenario8_candidateStepsDownOnSameTermLeaderAppendEntries() {
+    void scenario8_candidateStepsDownOnSameTermLeaderAppendEntries() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId otherLeader = new NodeId("n2");
@@ -302,7 +302,7 @@ class RaftNodeTest {
     // Scenario 9: a vote is denied to a candidate whose log is less up-to-date
     // =====================================================================
     @Test
-    void scenario9_voteDeniedToLessUpToDateCandidate() {
+    void scenario9_voteDeniedToLessUpToDateCandidate() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId leader = new NodeId("leader");
@@ -327,7 +327,7 @@ class RaftNodeTest {
     // Scenario 10: a stale leader (still on an old term) is rejected once a higher term has been observed
     // =====================================================================
     @Test
-    void scenario10_staleLeaderIsRejectedAfterNewTermElection() {
+    void scenario10_staleLeaderIsRejectedAfterNewTermElection() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId staleLeader = new NodeId("stale-leader");
@@ -355,7 +355,7 @@ class RaftNodeTest {
     // Bonus: a sole node (no peers) is its own trivial majority
     // =====================================================================
     @Test
-    void bonus_soleNodeClusterBecomesLeaderAndCommitsImmediately() {
+    void bonus_soleNodeClusterBecomesLeaderAndCommitsImmediately() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         RaftNode node = newNode(new NodeId("n1"), Set.of(), clock);
 
@@ -371,7 +371,7 @@ class RaftNodeTest {
     // Bonus: election timeouts are actually randomized, not a disguised constant
     // =====================================================================
     @Test
-    void bonus_electionTimeoutsAreRandomizedAcrossSuccessiveElections() {
+    void bonus_electionTimeoutsAreRandomizedAcrossSuccessiveElections() throws Exception {
         // A single node that never wins (peers never respond) keeps
         // re-running its own election indefinitely, drawing a fresh random
         // timeout each time. Measuring the elapsed time between successive
@@ -419,7 +419,7 @@ class RaftNodeTest {
      * looks at the actual passage of time as evidence of a problem.
      */
     @Test
-    void phase15_isolatedLeaderLosesQuorumContactWithinLeaseEvenWithoutHearingAHigherTerm() {
+    void phase15_isolatedLeaderLosesQuorumContactWithinLeaseEvenWithoutHearingAHigherTerm() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId peer1 = new NodeId("n2");
@@ -446,7 +446,7 @@ class RaftNodeTest {
     }
 
     @Test
-    void phase15_leaderWithOngoingAcksRetainsQuorumContact() {
+    void phase15_leaderWithOngoingAcksRetainsQuorumContact() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         NodeId peer1 = new NodeId("n2");
@@ -472,7 +472,7 @@ class RaftNodeTest {
     }
 
     @Test
-    void phase15_soleNodeAlwaysHasQuorumContact() {
+    void phase15_soleNodeAlwaysHasQuorumContact() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         RaftNode node = newNode(new NodeId("n1"), Set.of(), clock);
         clock.advance(PAST_ELECTION_TIMEOUT);
@@ -484,7 +484,7 @@ class RaftNodeTest {
     }
 
     @Test
-    void phase15_canServeAuthoritativelyIsFalseForNonLeaders() {
+    void phase15_canServeAuthoritativelyIsFalseForNonLeaders() throws Exception {
         MutableClock clock = new MutableClock(Instant.EPOCH);
         NodeId self = new NodeId("n1");
         RaftNode follower = newNode(self, Set.of(new NodeId("n2")), clock);
@@ -496,7 +496,7 @@ class RaftNodeTest {
     }
 
     @Test
-    void confirmedLeaderIsFalseUntilANoOpActuallyCommits() {
+    void confirmedLeaderIsFalseUntilANoOpActuallyCommits() throws Exception {
         // A 5-node cluster is used deliberately: with 3, winning the minimum
         // quorum of votes (self + 1 peer) and that same peer's first ack
         // already forms a majority, collapsing "elected" and "confirmed"

@@ -218,19 +218,71 @@ Each prints a full results table and writes a timestamped CSV to
 mvn clean test
 ```
 
-472 tests, 0 failures — every one of the behaviors above, plus unit-level
+493 tests, 0 failures — every one of the behaviors above, plus unit-level
 coverage of the WAL, SSTable format, MemTable, concurrency, protocol
 framing, and membership/failure-detection state machines, all in one run
 (roughly 2 minutes).
 
+## Step 13 — The real multi-process launcher
+
+Post-Phase-15 audit addition: every step above runs through test/benchmark
+code that spins up real sockets and real objects, but still inside one
+JVM. This step is the same failover story as Steps 7-9, as three genuinely
+separate OS processes, driven only by a plain-text config file and a real
+client — the actual command sequence, actual output, run once while
+writing this document:
+
+```bash
+mvn -pl forge-cluster -am install -DskipTests
+
+cat > /tmp/forge-demo/cluster.conf <<'EOF'
+d1 localhost 18001 18002 18003
+d2 localhost 18011 18012 18013
+d3 localhost 18021 18022 18023
+EOF
+
+# one terminal each (or background processes, as done here):
+mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="/tmp/forge-demo/cluster.conf d1 /tmp/forge-demo/data-d1"
+mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="/tmp/forge-demo/cluster.conf d2 /tmp/forge-demo/data-d2"
+mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="/tmp/forge-demo/cluster.conf d3 /tmp/forge-demo/data-d3"
+```
+
+Each node's own log shows it coming up and finding the others:
+```
+INFO com.forge.cluster.launcher.ClusterNodeMain -- FORGE cluster node 'd2' up — client port 18013, raft port 18011, data directory /tmp/forge-demo/data-d2
+INFO com.forge.cluster.replication.ReplicationServer -- follower d3 connected, requesting catch-up from sequence 2000000000
+INFO com.forge.cluster.replication.ReplicationServer -- follower d1 connected, requesting catch-up from sequence 2000000000
+```
+d2 won the election this run (term 2). A real client against the real
+leader succeeds; the same write against a real follower is rejected with
+the real protocol error, not silently accepted:
+```
+$ java ... Client put 18013 demo-key demo-value
+PUT OK
+$ java ... Client put 18003 demo-key should-fail
+Exception in thread "main" com.forge.client.ForgeServerException: NOT_LEADER term=2 leader=d2
+$ java ... Client get 18003 demo-key   # a FOLLOWER's own store — got there by real replication
+GET demo-key = demo-value
+```
+Killing d2's process outright (`kill -9`) produces a real election among
+the two survivors, logged the same way Step 7 showed inside one JVM:
+```
+INFO ReplicationFollowerCoordinator -- d3: stopping current replication follower (switching to leader d1 for term 3)
+INFO ReplicationFollowerCoordinator -- d3: now following leader d1 (term 3) from sequence 3000000000
+```
+
+See [README §19](../README.md#19-how-to-run-a-multi-node-cluster--partitioning--replication--failover)
+for the full command reference and [ClusterNodeMain](../forge-cluster/src/main/java/com/forge/cluster/launcher/ClusterNodeMain.java)'s
+Javadoc for scope (single-partition; no process-management of its own).
+
 ---
 
-**What this demo deliberately does not show**: a genuine "type a command,
-watch three separate terminal windows react" experience, since no
-standalone multi-node launcher exists yet (README §22/§23). Everything
-shown above is real — real sockets, real separate server/client/consensus
-objects, real crashes (`RaftCluster.close()` really does simulate one),
-a real network partition (`FaultInjectingTcpProxy`), and a real snapshot
-resync — just orchestrated by test/benchmark code rather than a CLI.
-Building that launcher is the natural next step to make this demo more
-visually compelling; see README §23 (Future Work).
+Every scenario above is real — real sockets, real separate
+server/client/consensus objects, real crashes (`RaftCluster.close()` in
+the in-JVM steps, `kill -9` on a real process in Step 13), a real network
+partition (`FaultInjectingTcpProxy`), and a real snapshot resync. Steps
+1-12 orchestrate that reality through test/benchmark code, which is the
+fastest way to exercise every named scenario reproducibly; Step 13 is the
+same reality as standalone, independently-started processes — the
+"type a command, watch three terminals react" experience previous
+revisions of this document said didn't exist yet.

@@ -2,12 +2,14 @@
 
 A distributed key-value database, built incrementally, from scratch, in Java.
 
-**Status: all 8 core phases complete, plus Phase 15** (partitioning,
-membership/failure detection, replication, recovery, chaos testing,
-distributed benchmarking, compaction/Bloom filters, Raft consensus, and
-Raft-driven data-plane failover with stale-leader fencing) — 472/472
-tests passing. See [PROGRESS.md](PROGRESS.md) for the full phase-by-phase
-log, including real bugs found and fixed along the way, and this README's
+**Status: all 8 core phases complete, plus Phase 15 and a post-Phase-15
+engineering audit** (partitioning, membership/failure detection,
+replication, recovery, chaos testing, distributed benchmarking,
+compaction/Bloom filters, Raft consensus, Raft-driven data-plane failover
+with stale-leader fencing, durable Raft term/vote state, and a real
+multi-process cluster launcher) — 493/493 tests passing. See
+[PROGRESS.md](PROGRESS.md) for the full phase-by-phase log, including real
+bugs found and fixed along the way, and this README's
 [Limitations](#22-limitations) section for what's honestly not done yet.
 
 ## 1. What FORGE is, and why it exists
@@ -255,7 +257,7 @@ Requires Java 21+ and Maven.
 mvn clean install    # builds all 7 modules, runs all tests
 ```
 
-472 tests across `forge-common`, `forge-storage`, `forge-server`,
+493 tests across `forge-common`, `forge-storage`, `forge-server`,
 `forge-client`, `forge-cluster`, `forge-bench`, and `tests` (0 failures).
 
 ## 18. How to run a single node
@@ -283,10 +285,37 @@ mvn -pl forge-server exec:java -Dexec.args="status <dataDirectory>"
 
 ## 19. How to run a multi-node cluster / partitioning / replication / failover
 
-There is currently no single "launch a full N-node cluster" CLI (see
-[Limitations](#22-limitations)) — but every one of these behaviors is
-real, already wired together, and demonstrated end-to-end by the
-integration tests below, each spinning up genuine separate
+**Post-Phase-15 audit addition: a real CLI launcher.** `ClusterNodeMain`
+brings up one full cluster node (storage, replication, Raft with
+persistent state, failover coordination, and the client-facing server) as
+a genuine standalone process — no test harness involved:
+
+```bash
+mvn -pl forge-cluster -am install -DskipTests
+
+cat > cluster.conf <<'EOF'
+# nodeId  host       raftPort  replicationPort  clientPort
+a         localhost  17001     17002            17003
+b         localhost  17011     17012            17013
+c         localhost  17021     17022            17023
+EOF
+
+# run once per line, in three separate terminals (or as three background processes):
+mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="cluster.conf a /tmp/forge-a"
+mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="cluster.conf b /tmp/forge-b"
+mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="cluster.conf c /tmp/forge-c"
+```
+
+Three real OS processes elect a leader, accept writes only through it
+(`ForgeClient.connect("localhost", <leader's clientPort>)`), replicate to
+the other two, and fail over for real if the leader process is killed —
+see [docs/DEMO.md](docs/DEMO.md#step-13-the-real-multi-process-launcher)
+for a full walkthrough with real output. Scope: single-partition (id
+`"p0"`), matching `PartitionLeadership`'s current scope — every listed
+node is a replica of that one partition.
+
+Everything below remains true and is still how each individual mechanism
+is proven in isolation, each spinning up genuine separate
 `ForgeServer`/`ReplicationServer`/`RaftCluster` instances with real socket
 traffic between them:
 
@@ -355,16 +384,27 @@ and [docs/CONSISTENCY.md](docs/CONSISTENCY.md) for full detail:
   bounds how much *worse* this can get (fencing the old leader from
   accepting *more* such writes) but doesn't retroactively protect
   already-orphaned ones.
-- **Raft has no persistent state** — a node that crashes and restarts
-  mid-term rejoins as a brand-new participant; a narrow theoretical
-  safety gap relative to the paper, disclosed in `RaftNode`'s Javadoc.
+- **Raft persists `currentTerm`/`votedFor` (post-Phase-15 audit) but still
+  not the log.** A restarted node can no longer double-vote in a term it
+  already voted in (the paper's core safety concern) — but its log is
+  always empty after a restart, which correctly (per Raft's own
+  up-to-date-log rule) means it can never win an election against a peer
+  with a non-empty log. In a cluster no larger than the bare minimum
+  quorum (2 nodes) this is a genuine, disclosed **liveness** dead end:
+  neither the restarted node nor its lone surviving peer can ever become
+  leader again. With 3+ nodes it's not fatal — the surviving majority
+  elects without the restarted node's vote, and its log is repaired via
+  the ordinary follower path. See `RaftPersistentState`'s Javadoc for the
+  full reasoning and `RaftClusterPersistenceIntegrationTest` for the proof.
 - **Full resync on rejoin is detected but not auto-performed** — a
   caller must explicitly invoke `StaleReplicaRecovery`; see
   [PROGRESS.md](PROGRESS.md)'s Phase 15 known limitations for why.
 - **No authentication, authorization, or transport encryption** — every
   TCP connection is trusted.
-- **No multi-node CLI launcher** — real multi-node behavior is proven by
-  the integration tests (§19), not a standalone "start a cluster" command.
+- **The multi-node CLI launcher (§19) has no process-management or
+  health-checking of its own** — it wires up one node's own components
+  correctly; starting/stopping/monitoring N of them is still up to the
+  operator or a wrapping script, not this project.
 - **No network-queryable admin/metrics endpoint** — real metrics exist as
   Java accessors (`RaftCluster.currentLeader()`, `FailureDetector.snapshot()`,
   `ConcurrentLsmKeyValueStore.status()`) but aren't exposed remotely; see
@@ -378,10 +418,21 @@ and [docs/CONSISTENCY.md](docs/CONSISTENCY.md) for full detail:
 
 ## 23. Future work
 
-In roughly the order it would naturally continue:
+Persistent Raft state (`currentTerm`/`votedFor`) and a real multi-process
+CLI launcher were identified, by an explicit post-Phase-15 engineering
+audit, as the two items that would materially improve correctness and
+demonstrability, and were implemented — see PROGRESS.md's "Post-Phase-15
+engineering audit" section for the full reasoning on why those two and not
+the other candidates considered (stronger fencing/epochs, TLS, an
+admin/metrics endpoint, leveled compaction, multi-machine benchmarking —
+each was deliberately deferred, with a stated reason, not overlooked).
 
-1. Persistent Raft state (mirroring the WAL's own crash-safety
-   discipline), closing the crash-mid-term gap.
+In roughly the order remaining work would naturally continue:
+
+1. Persist the Raft log too, closing the 2-node liveness gap described in
+   §22 (a materially bigger change — durable storage keyed to every log
+   mutation/truncation — deferred pending it actually mattering at a
+   cluster size this project runs).
 2. Extend Phase 15's fencing to a genuine multi-partition deployment (one
    `RaftCluster`/`PartitionLeadership` per partition per node, not one
    per node).

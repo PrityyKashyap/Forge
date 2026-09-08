@@ -206,10 +206,19 @@ requirement ("do not merely rename the existing replication system
 Raft") satisfied by construction, not just by naming.
 
 **What's the biggest thing this Raft implementation still doesn't do?**
-It keeps no persistent state — a crash-restart mid-term could in
-principle vote twice in that term, a narrow, real gap vs. the paper,
-disclosed in `RaftNode`'s Javadoc. (As of Phase 15, it *is* wired into
-live data-plane failover — see the next section.)
+Post-Phase-15 audit: it now persists `currentTerm`/`votedFor`
+(`RaftPersistentState`, mirroring the WAL's temp-file/force/rename
+discipline), closing the double-vote-after-restart gap the paper is
+strictest about. What it still doesn't persist is the log itself — for
+this project that's a deliberate, low-cost choice (the log only ever
+holds disposable no-op leadership markers), but it has one real,
+disclosed consequence: a restarted node's log is always empty, so Raft's
+own up-to-date-log election rule correctly refuses to elect it, no matter
+how high its term climbs. In a 2-node cluster that's a genuine permanent
+liveness dead end; at 3+ nodes it isn't, since the surviving majority can
+elect without that node's vote at all. Found and documented via a flaky
+test, not by inspection alone — see PROGRESS.md's audit section for the
+exact story.
 
 ## Data-plane failover & fencing (Phase 15)
 
@@ -268,8 +277,11 @@ only stops the old leader from adding *more* such orphaned writes once
 its lease expires.
 
 **How does an old leader rejoin safely?**
-Its fresh `RaftNode` (no persistent state — see above) learns the current
-term from a real message and steps down. Its `ReplicationFollowerCoordinator`
+Its `RaftNode` now reloads its persisted `currentTerm`/`votedFor` on
+restart (see above), but its log still starts empty either way, so it
+still can't itself win an election against a peer with real log entries —
+it steps down as soon as it hears the current term from a real message,
+same as before persistence existed. Its `ReplicationFollowerCoordinator`
 then checks: is this the *first* time (this process's life) it's
 considered following anyone, and does its existing data imply an older
 term than the cluster's current one? If so, it flags `needsFullResync()`
@@ -324,9 +336,56 @@ Async-only was kept because it's what got built and tested; adding a sync
 mode is real, disclosed future work, not something quietly abandoned.
 
 **What would you change if this went to production tomorrow?**
-In order: wire Raft into the data plane to close the split-brain gap (the
-single biggest correctness gap); add persistent Raft state; add
-authentication/TLS (never attempted — out of this project's scope); add
-a leveled compaction strategy if datasets grew past what full-rewrite
-compaction handles comfortably. See README §22 for the full list, in
-priority order.
+Both biggest items on this list as of the original Phase 15 report — wiring
+Raft into the data plane, and persisting Raft's `currentTerm`/`votedFor`
+— are now done. What's left, in order: persist the Raft log too (closes
+the 2-node liveness gap discovered while adding term/vote persistence —
+see PROGRESS.md's audit section); extend fencing to a genuine
+multi-partition deployment; add authentication/TLS (never attempted — out
+of this project's scope); add a leveled compaction strategy if datasets
+grew past what full-rewrite compaction handles comfortably. See README
+§22/23 for the full list, in priority order.
+
+## Post-Phase-15 engineering audit
+
+**Why persist `currentTerm`/`votedFor` but not the log?**
+The log only ever carries one no-op "I am leader" marker per election —
+never real KV data (Phase 9's replication is the actual data path,
+untouched). Losing it on restart costs a follower nothing (the existing
+`nextIndex` back-off already repairs it from whichever leader is current).
+Persisting `currentTerm`/`votedFor` closes a real, paper-cited safety gap
+(double-voting across a restart) for a small, well-contained change;
+persisting the log too would be a materially bigger one (durable storage
+keyed to every log mutation/truncation) for data this project already
+doesn't need to survive a restart as a follower. The honest cost of that
+choice — a restarted node can't itself win an election again in a 2-node
+cluster — is disclosed, not hidden; see the previous section.
+
+**How did you find the 2-node liveness gap?**
+A flaky test, not a design review. A "restart reloads its persisted term"
+test using a 2-node cluster intermittently failed waiting for the
+restarted node to become leader again — about 1 run in 5. `jstack`-style
+reasoning wasn't needed this time; reading the actual `RaftNode` code
+explained it immediately: the restarted node's empty log always loses
+Raft's up-to-date-log check against its peer's non-empty one, regardless
+of term, and the peer alone can never reach a 2-node majority either.
+Structurally the same lesson as Phase 15's own chaos Scenario K (a
+test that assumed a minority could still elect a leader) — recognized as
+a test correctly exposing a real, narrow, disclosed property, not a
+defect to code around, and fixed by testing the actually-correct behavior
+(a 3-node cluster's surviving majority elects without that node's vote,
+and it rejoins as a follower) instead.
+
+**Why does a real multi-node launcher matter if the tests already prove
+everything works?**
+Because "the tests prove it" and "you can watch it happen" are different
+kinds of confidence, and the project's own `docs/DEMO.md` had said outright
+that only the first one existed. `ClusterNodeMain` is deliberately thin —
+all the actual wiring is the same construction sequence
+`FailoverReplicationIntegrationTest` already used — because the goal
+wasn't a new mechanism, it was making an already-correct one demonstrable
+as real, independent operating-system processes: a real election, a real
+client write through the elected leader, a real rejection from a
+follower, and a real `kill -9`-triggered failover, confirmed manually
+(not just via the automated in-process tests) and recorded in
+`docs/DEMO.md` Step 13.

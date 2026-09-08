@@ -170,8 +170,10 @@ the paper's Figure 8 commit-safety rule — used as the **control plane**
 for deciding which node currently leads. Deliberately not a replacement
 for §3.8's replication: Raft's own log carries nothing but a one-entry-per-
 election marker, never real KV writes. See PROGRESS.md's Phase 14 section
-for the precise scope (no persistent Raft state — see that section for the
-disclosed gap this leaves).
+for the original scope, and the "Post-Phase-15 engineering audit" section
+for `currentTerm`/`votedFor` persistence added afterward (`RaftPersistentState`)
+— the log itself remains deliberately unpersisted; see that section's
+disclosed liveness consequence for a bare-minimum-quorum cluster.
 
 ### 3.13 Fenced data-plane leadership & automated failover (Phase 15)
 Phase 14's consensus result is wired into §3.4/§3.8's live runtime via
@@ -211,6 +213,19 @@ synchronous (deliberately unchanged — DESIGN.md §2), or extend fencing to
 leader or not), or support more than one Raft group per node/partition
 (single-partition scope this phase — see PROGRESS.md's Phase 15 known
 limitations).
+
+### 3.14 Multi-node launcher (post-Phase-15 audit)
+`com.forge.cluster.launcher` (`ClusterConfig`/`NodeSpec`/`ClusterNode`/
+`ClusterNodeMain`) is a real CLI that starts one full cluster node — every
+component from §§3.1-3.13 wired together exactly as §3.13 describes —
+from a plain-text, one-line-per-node config file, as a genuine standalone
+process. `ClusterNode.start(...)` holds the actual wiring (directly
+testable in-process, real ports, no subprocess needed); `ClusterNodeMain`
+is a thin CLI shell around it. Closes the "no way to run an N-node cluster
+except from tests" gap named throughout Phase 15's own documentation — see
+PROGRESS.md's "Post-Phase-15 engineering audit" section and docs/DEMO.md
+Step 13. Single-partition scope, matching §3.13 exactly; no
+process-management of its own.
 
 ## 4. Repository structure
 

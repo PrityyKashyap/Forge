@@ -83,12 +83,18 @@ public final class RaftRpcServer implements Closeable {
             switch (messageType) {
                 case RaftWireFormat.MSG_REQUEST_VOTE -> {
                     RequestVoteRequest request = RaftWireFormat.readRequestVoteRequest(in);
-                    RequestVoteResponse response = node.handleRequestVote(request);
+                    RequestVoteResponse response = handleRequestVote(request);
+                    if (response == null) {
+                        return; // failed to durably persist the vote — see handleRequestVote; no response sent
+                    }
                     RaftWireFormat.writeRequestVoteResponse(out, response);
                 }
                 case RaftWireFormat.MSG_APPEND_ENTRIES -> {
                     AppendEntriesRequest request = RaftWireFormat.readAppendEntriesRequest(in);
-                    AppendEntriesResponse response = node.handleAppendEntries(request);
+                    AppendEntriesResponse response = handleAppendEntries(request);
+                    if (response == null) {
+                        return; // failed to durably persist the term/vote change — see handleAppendEntries
+                    }
                     RaftWireFormat.writeAppendEntriesResponse(out, response);
                 }
                 default -> log.warn("Raft RPC server for {} received an unrecognized message type {}",
@@ -97,6 +103,28 @@ public final class RaftRpcServer implements Closeable {
             out.flush();
         } catch (IOException e) {
             log.debug("Raft RPC connection to {} failed or was closed by the peer", node.selfId(), e);
+        }
+    }
+
+    /** @return the response, or {@code null} if a durable-persistence failure means no response should be sent at all. */
+    private RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
+        try {
+            return node.handleRequestVote(request);
+        } catch (IOException e) {
+            log.warn("failed to durably persist Raft state while handling a RequestVote from {}; "
+                    + "not responding — the candidate will simply see this as a dropped RPC and retry", node.selfId(), e);
+            return null;
+        }
+    }
+
+    /** @return the response, or {@code null} if a durable-persistence failure means no response should be sent at all. */
+    private AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+        try {
+            return node.handleAppendEntries(request);
+        } catch (IOException e) {
+            log.warn("failed to durably persist Raft state while handling an AppendEntries from {}; "
+                    + "not responding — the leader will simply see this as a dropped RPC and retry", node.selfId(), e);
+            return null;
         }
     }
 

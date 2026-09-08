@@ -13,6 +13,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
@@ -81,6 +82,38 @@ public final class RaftCluster implements Closeable {
         scheduler.scheduleAtFixedRate(this::doTick, 0, tickInterval.toMillis(), TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * Post-Phase-15 audit addition: as the other full constructor, but with
+     * {@code currentTerm}/{@code votedFor} durably persisted to {@code
+     * persistentStateFile} — see {@link RaftPersistentState} and {@link
+     * RaftNode}'s class Javadoc for exactly what this closes (a restarted
+     * node can never grant two votes in a term it already voted in) and
+     * what it deliberately still doesn't cover (the log itself, safe here
+     * since it never holds real data). {@code persistentStateFile} is
+     * loaded synchronously before the node starts, seeding its initial
+     * term/vote; a genuinely corrupt file makes this constructor throw
+     * rather than silently starting at term 0 (see {@link
+     * RaftPersistentState#load}).
+     */
+    public RaftCluster(NodeId selfId, Map<NodeId, NodeAddress> peerAddresses, int port, Clock clock,
+            Duration electionTimeoutMin, Duration electionTimeoutMax, Duration heartbeatInterval,
+            Duration tickInterval, Duration rpcTimeout, Duration leaseDuration, Random random,
+            Path persistentStateFile) throws IOException {
+        this.peerAddresses = Map.copyOf(Objects.requireNonNull(peerAddresses, "peerAddresses must not be null"));
+        this.rpcTimeout = Objects.requireNonNull(rpcTimeout, "rpcTimeout must not be null");
+        this.leaseDuration = Objects.requireNonNull(leaseDuration, "leaseDuration must not be null");
+        Objects.requireNonNull(persistentStateFile, "persistentStateFile must not be null");
+        RaftPersistentState persistentState = RaftPersistentState.load(persistentStateFile);
+        this.node = new RaftNode(selfId, this.peerAddresses.keySet(), clock, electionTimeoutMin, electionTimeoutMax,
+                heartbeatInterval, random, persistentState::save,
+                persistentState.currentTerm(), persistentState.votedFor().orElse(null));
+        this.rpcServer = new RaftRpcServer(node, port);
+        this.dispatchExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(
+                r -> Thread.ofPlatform().name("raft-ticker-" + selfId).unstarted(r));
+        scheduler.scheduleAtFixedRate(this::doTick, 0, tickInterval.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
     public int port() {
         return rpcServer.port();
     }
@@ -122,6 +155,10 @@ public final class RaftCluster implements Closeable {
         } catch (RuntimeException e) {
             log.error("Raft tick failed for {}", node.selfId(), e);
             return;
+        } catch (IOException e) {
+            log.warn("failed to durably persist Raft state while starting an election for {}; skipping this tick"
+                    + " — the election timeout will simply elapse again and retry on a later tick", node.selfId(), e);
+            return;
         }
         for (RaftAction action : actions) {
             dispatchExecutor.execute(() -> dispatch(action));
@@ -141,6 +178,7 @@ public final class RaftCluster implements Closeable {
     }
 
     private void dispatchRequestVote(NodeAddress address, RaftAction.SendRequestVote action) {
+        RequestVoteResponse response;
         try (Socket socket = connect(address)) {
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             out.writeByte(RaftWireFormat.MSG_REQUEST_VOTE);
@@ -148,18 +186,26 @@ public final class RaftCluster implements Closeable {
             out.flush();
 
             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-            RequestVoteResponse response = RaftWireFormat.readRequestVoteResponse(in);
+            response = RaftWireFormat.readRequestVoteResponse(in);
+        } catch (IOException e) {
+            log.debug("RequestVote to {} failed (peer down, partitioned, or timed out) — dropping, no retry needed",
+                    action.to(), e);
+            return;
+        }
+        try {
             List<RaftAction> followUp = node.handleRequestVoteResponse(action.to(), response);
             for (RaftAction next : followUp) {
                 dispatchExecutor.execute(() -> dispatch(next));
             }
         } catch (IOException e) {
-            log.debug("RequestVote to {} failed (peer down, partitioned, or timed out) — dropping, no retry needed",
+            log.warn("failed to durably persist Raft state while processing a RequestVote response from {}; "
+                    + "treating this response as dropped rather than risk acting on an unpersisted state change",
                     action.to(), e);
         }
     }
 
     private void dispatchAppendEntries(NodeAddress address, RaftAction.SendAppendEntries action) {
+        AppendEntriesResponse response;
         try (Socket socket = connect(address)) {
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             out.writeByte(RaftWireFormat.MSG_APPEND_ENTRIES);
@@ -167,10 +213,17 @@ public final class RaftCluster implements Closeable {
             out.flush();
 
             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-            AppendEntriesResponse response = RaftWireFormat.readAppendEntriesResponse(in);
-            node.handleAppendEntriesResponse(action.to(), action.request(), response);
+            response = RaftWireFormat.readAppendEntriesResponse(in);
         } catch (IOException e) {
             log.debug("AppendEntries to {} failed (peer down, partitioned, or timed out) — dropping, retried next heartbeat",
+                    action.to(), e);
+            return;
+        }
+        try {
+            node.handleAppendEntriesResponse(action.to(), action.request(), response);
+        } catch (IOException e) {
+            log.warn("failed to durably persist Raft state while processing an AppendEntries response from {}; "
+                    + "treating this response as dropped rather than risk acting on an unpersisted state change",
                     action.to(), e);
         }
     }
