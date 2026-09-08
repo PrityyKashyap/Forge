@@ -1,12 +1,8 @@
 target/
+**/target/
+forge-data/
 *.class
 *.log
-
-.idea/
-*.iml
-.vscode/
-.settings/
-.classpath
-.project
-
 .DS_Store
+.idea/
+.vscode/

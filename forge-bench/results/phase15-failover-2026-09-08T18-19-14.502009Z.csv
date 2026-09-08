@@ -1,0 +1,16 @@
+experiment_id,description,timestamp,metric,value,unit
+E17,Failover timing (run 1),2026-09-08T18:19:14.916677Z,election_time_seconds,0.249892,seconds
+E17,Failover timing (run 1),2026-09-08T18:19:14.916704Z,leadership_transition_seconds,0.252844,seconds
+E17,Failover timing (run 1),2026-09-08T18:19:14.916707Z,time_to_first_successful_write_seconds,0.258855,seconds
+E17,Failover timing (run 2),2026-09-08T18:19:15.250193Z,election_time_seconds,0.201603,seconds
+E17,Failover timing (run 2),2026-09-08T18:19:15.250200Z,leadership_transition_seconds,0.203671,seconds
+E17,Failover timing (run 2),2026-09-08T18:19:15.250201Z,time_to_first_successful_write_seconds,0.209441,seconds
+E17,Failover timing (run 3),2026-09-08T18:19:15.702070Z,election_time_seconds,0.327586,seconds
+E17,Failover timing (run 3),2026-09-08T18:19:15.702077Z,leadership_transition_seconds,0.329691,seconds
+E17,Failover timing (run 3),2026-09-08T18:19:15.702079Z,time_to_first_successful_write_seconds,0.335496,seconds
+E17,Failover timing (run 4),2026-09-08T18:19:16.317434Z,election_time_seconds,0.486068,seconds
+E17,Failover timing (run 4),2026-09-08T18:19:16.317441Z,leadership_transition_seconds,0.487656,seconds
+E17,Failover timing (run 4),2026-09-08T18:19:16.317443Z,time_to_first_successful_write_seconds,0.496554,seconds
+E17,Failover timing (run 5),2026-09-08T18:19:16.721623Z,election_time_seconds,0.278797,seconds
+E17,Failover timing (run 5),2026-09-08T18:19:16.721628Z,leadership_transition_seconds,0.280982,seconds
+E17,Failover timing (run 5),2026-09-08T18:19:16.721629Z,time_to_first_successful_write_seconds,0.288641,seconds
