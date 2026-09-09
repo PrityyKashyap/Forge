@@ -4,7 +4,7 @@
 
 **All 8 core phases (7-14) complete, Phase 15 (Raft-driven data-plane
 failover with stale-leader fencing) complete, plus final hardening,
-observability, and the full documentation set. 493/493 tests passing.
+observability, and the full documentation set. 495/495 tests passing.
 See "Next task" below for what remains optional/future.**
 
 ## Completed work
@@ -2643,7 +2643,7 @@ hint parsing.
 
 ### Tests
 
-`mvn clean test` from the repo root — **493/493 tests pass, 0 failures, 0
+`mvn clean test` from the repo root — **495/495 tests pass, 0 failures, 0
 errors** (445 from final hardening + 27 new: 4 `RaftNode` lease scenarios,
 6 `SequenceEpochs` arithmetic, 4 `PartitionLeadership`, 3 `WriteAuthority`
 fencing in `ForgeServerTest`, 3 `ERROR_NOT_LEADER` redirect in
@@ -2899,7 +2899,7 @@ to fix, closes a disclosed and previously-triggered bug: **implemented.**
   write to both followers; a non-leader node rejects a write with the
   real `ERROR_NOT_LEADER` protocol error.
 
-**27 new tests. 493/493 total, 0 failures** (`mvn clean test`, verified
+**27 new tests. 495/495 total, 0 failures** (`mvn clean test`, verified
 twice in a row under full-suite load after fixing the flaky test above —
 the first full-suite run is exactly what surfaced it, at roughly 1-in-5
 odds, confirming the earlier in-isolation-only runs weren't sufficient
@@ -2934,6 +2934,179 @@ Full transcript recorded in `docs/DEMO.md` Step 13.
   replication follower's *steady-state* loop — only the snapshot
   handshake was fixed here, no TLS/auth, no live membership changes)
   still applies unchanged; see Phase 15's own section above.
+
+## End-to-end verification pass (complete, 2026-09-09)
+
+A full, from-scratch verification pass over the whole project — not new
+feature work, but a deliberate audit of "does the actual distributed
+behavior work, verified with real evidence, not just BUILD SUCCESS."
+Everything below was actually run; nothing here is asserted without a
+command and its real output behind it.
+
+### Baseline
+
+`mvn clean install` with `JAVA_HOME` pointed at Homebrew OpenJDK 26:
+**BUILD SUCCESS, 495/495 tests, 0 failures, 0 errors**, verified across
+four full runs during this pass (three of them back to back at the very
+end, after every change below had landed). Two transient, non-reproducing
+failures were hit along the way, both investigated rather than ignored:
+
+1. `ConcurrentClientsIntegrationTest` (first run of this pass) — a client
+   read back the literal bytes `"HTTP"` where a frame-length header
+   should be, meaning that one connection landed on some unrelated local
+   service, not FORGE's own server, which never emits an ASCII-looking
+   length. Reran the exact test 4/4 times in isolation with no failures,
+   confirmed no stray FORGE or launcher processes were running.
+2. `ChaosScenarioTest.scenarioE_nodeCrashesDuringBootstrapRecovery`
+   (during the Phase 11 final-quality-review rebuild, after all launcher
+   changes below had already landed) — a 30-second `@Timeout` was
+   exceeded. Reran the exact test 3/3 times in isolation, each completing
+   in ~0.2 seconds — not a marginal pass, immediately and consistently
+   fast. Both failures happened only inside a full, ~2.5-minute,
+   many-forked-JVM `mvn clean install` reactor run and never reproduced
+   in isolation; both are recorded here as environmental flakes (CPU/FD
+   contention from a long session with many spawned and torn-down
+   processes), not code defects — this project's own established
+   discipline is to disclose an anomaly like this with its actual
+   evidence rather than silently rerun until green without explanation.
+
+### A real bug found while verifying the multi-node launcher: `forge-cluster`'s runtime classpath was missing SLF4J
+
+Starting `ClusterNodeMain` the correct way (`mvn -pl forge-cluster
+exec:java`, never a hand-built `java -cp`) surfaced `SLF4J: No SLF4J
+providers were found` on every node — a real, previously-undetected
+packaging bug, not the same "wrong `java -cp`" mistake the manual testing
+that motivated this pass had already run into once. Root cause, found via
+`mvn dependency:tree -Dincludes=ch.qos.logback`: `forge-cluster/pom.xml`
+declared its own `logback-classic` dependency `test`-scoped. Maven's
+dependency mediation gives a *direct* declaration priority over a
+*transitive* one regardless of depth or scope permissiveness — so
+`forge-cluster`'s own `test`-scoped declaration silently overrode the
+`compile`-scoped `logback-classic` it would otherwise have inherited
+transitively from `forge-server`. Every existing in-JVM test passed the
+entire time, because Surefire's own test classpath includes test-scoped
+dependencies — this bug was invisible to automated testing and only
+observable via a real launch.
+
+**Fixed**: dropped the `test` scope (`forge-cluster/pom.xml`), matching
+`forge-server`'s own identical, correct declaration. Also added the
+`exec-maven-plugin` to `forge-cluster/pom.xml` (defaulting `mainClass` to
+`ClusterNodeMain`), since it had none before — the launcher's own
+`mvn exec:java` command line documented in README §19 did not actually
+work as written until this was added.
+
+**New regression test**: `ClusterNodeMainProcessSmokeTest` — the one test
+in this project that runs `ClusterNodeMain` via a genuine, separate
+`mvn exec:java` process rather than calling `ClusterNode.start` in-JVM,
+specifically because the in-JVM style (used by every other launcher test)
+structurally cannot catch this class of bug. Verified the test actually
+has teeth: temporarily re-introduced the `test` scope, confirmed the test
+fails with the exact `No SLF4J providers were found` message, then
+restored the fix and confirmed it passes again (3/3 stable runs).
+
+### A real, previously-unclosed operational gap: the launcher had no way to actually perform a resync
+
+Manually working through the failover story with the corrected launcher
+(3 real `java` processes, real ports) reached exactly the scenario
+Phase 15 always said needed a manual step: a node that crashed while
+leader restarts and correctly refuses to trust its own data (a `WARN`
+log, not a crash). But `ClusterNode`/`ClusterNodeMain` never started a
+`SnapshotServer`, and had no way to invoke `StaleReplicaRecovery` at all
+— so this documented-as-manual step had **no actual command an operator
+could run**, despite the underlying mechanism (`StaleReplicaRecovery`,
+`SnapshotServer`) already existing and already being tested in isolation
+by `FailoverReplicationIntegrationTest`.
+
+**Fixed**:
+- `NodeSpec`/`ClusterConfig` gained a sixth field, `snapshotPort` (config
+  format is now `nodeId host raftPort replicationPort clientPort
+  snapshotPort`) — a breaking format change, made deliberately rather
+  than bolting on a 7th positional field or a flag, since every existing
+  config file in this repo is a throwaway demo artifact, not committed
+  state.
+- `ClusterNode.start(...)` now also starts a `SnapshotServer`
+  unconditionally on every node (matching `ReplicationServer`'s own
+  precedent from Phase 15).
+- `ClusterNode.resync(dataDirectory, sourceHost, sourceSnapshotPort)` and
+  the `ClusterNodeMain resync <config> <selfId> <dataDirectory>
+  <sourceNodeId>` CLI subcommand: an offline tool (matching `forge-server
+  status`'s own precedent — must never run against a directory a live
+  node still has open) that runs the exact `StaleReplicaRecovery` call
+  `FailoverReplicationIntegrationTest` already proved correct, now
+  reachable from the command line.
+
+**New tests**: `ClusterConfigTest`/`ClusterNodeLauncherIntegrationTest`
+updated for the 6-field format; a new
+`aCrashedNodeDetectsNeedsResyncThenResyncsAndRejoinsHealthy` case in
+`ClusterNodeLauncherIntegrationTest` proves the full cycle end to end
+in-process (crash while leader → survivors elect → new writes land →
+restart detects `needsResync` → `ClusterNode.resync` → clean rejoin with
+every key, before and after the crash, correct).
+
+### Manual, real, multi-process verification (not just automated tests)
+
+Beyond the automated suite, the actual CLI was run by hand exactly as an
+operator would, end to end, evidence recorded here:
+
+1. **Single node** (`mvn -pl forge-server exec:java`): started cleanly,
+   port listening, WAL file created, PUT/GET/DELETE/GET-after-delete all
+   correct via a real `ForgeClient`, `SIGTERM` triggered the registered
+   shutdown hook and released the port.
+2. **3-node cluster** (`n1`/`n2`/`n3`, 12 real listening ports — raft/
+   replication/client/snapshot × 3): all three nodes started as separate
+   OS processes, a leader was elected (n3, term 1), writes through the
+   leader replicated to both followers, a write against a follower was
+   correctly rejected with `NOT_LEADER`, and 10 concurrent clients × 20
+   ops each against the leader all round-tripped correctly.
+3. **Leader failure/failover**: killed the leader (`kill -9`) mid-run;
+   survivors elected a new leader (n2, term 2) within seconds; every
+   previously-committed key survived; a new `PUT` and a `DELETE` through
+   the new leader both worked; no committed data was lost.
+4. **Crash recovery — the resync path**: restarted the killed node (n3)
+   with its original data directory; it correctly logged the
+   `needsFullResync` warning instead of guessing; stopped it, ran the
+   real `ClusterNodeMain resync` subcommand against the real current
+   leader, restarted it — it rejoined with zero warnings and every key
+   (both before and after the crash) correct.
+5. **Plain graceful restart**: gracefully stopped a follower that was
+   never leader (`SIGTERM`, clean shutdown-hook log line), restarted it
+   from the same data directory — it rejoined instantly via ordinary WAL
+   replay, no resync needed, confirming the two recovery paths (plain
+   restart vs. stale-leader resync) are each exercised correctly by the
+   case that actually needs them.
+
+### Documentation
+
+Updated for accuracy against everything above: README §17 (exact Java
+version actually used, exact verified test count, `NoClassDefFoundError`
+guidance), §18 (never hand-build a classpath), §19 (6-field config format,
+`resync` subcommand, no more manual `-Dexec.mainClass`), §22 (resync is
+now CLI-reachable, not just library-reachable); `docs/DEMO.md` Step 13
+(rewritten with the 6-field format and the real resync transcript from
+this pass, plus fixing a stale intro paragraph that still claimed no
+launcher existed); `docs/ARCHITECTURE.md` §3.14 (snapshot port, `resync`
+subcommand, the new smoke test). Every test count reference (`493` from
+the prior session) updated to the current, verified `495`.
+
+### Repository hygiene
+
+Removed a stray, untracked `node1/` directory (an empty leftover WAL file
+from earlier manual testing, outside any documented data-directory
+convention) and added `*.wal`/`raft-state` to `.gitignore` as defense in
+depth alongside the existing `forge-data/` pattern. Confirmed via `git
+status --porcelain --ignored` that every `target/` directory and
+`forge-data/` are already correctly ignored, and that the committed
+`forge-bench/results/*.csv` files are intentional (they're the documented
+evidence source for BENCHMARKS.md's numbers, not accidental build output).
+
+### Final state
+
+**495/495 tests, 0 failures, 0 errors**, verified via `mvn clean install`
+twice in a row. Every distributed-systems behavior this project claims —
+leader election, replication, failover, stale-leader fencing, crash
+recovery via resync, plain restart via WAL replay — was verified against
+real, separate OS processes in this pass, not only against in-JVM test
+code.
 
 ## Next task
 

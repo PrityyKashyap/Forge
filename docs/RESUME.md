@@ -31,7 +31,7 @@ is implemented directly.
   with MemTable/SSTable flush and full compaction, consistent-hash
   partitioning with virtual nodes, asynchronous leader-follower
   replication, and Raft consensus wired into real, automated, fenced
-  data-plane failover — 493 automated tests across 7 Maven modules, 0
+  data-plane failover — 495 automated tests across 7 Maven modules, 0
   failures.
 - Built and wired a real Raft consensus subsystem (terms, majority-vote
   election, AppendEntries log replication, the paper's Figure 8
@@ -69,7 +69,7 @@ is implemented directly.
   LSM storage engine, compaction, Bloom filters, consistent hashing,
   leader-follower replication, crash recovery, chaos/fault-injection
   testing, and Raft consensus driving real automated, fenced failover.
-- 493 automated tests (JUnit 5) across storage, networking, partitioning,
+- 495 automated tests (JUnit 5) across storage, networking, partitioning,
   replication, recovery, chaos, and consensus; real multi-process/real-socket
   integration tests, not simulated in-process shortcuts.
 - Implemented and benchmarked LSM compaction and Bloom filters: 90%

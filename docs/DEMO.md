@@ -2,12 +2,12 @@
 
 A reproducible walkthrough using only commands that actually exist and
 actually work in this repository (every one was run and its real output
-checked while writing this document). There is currently no single
-"launch an N-node cluster and poke it with a CLI" tool — see README's
-[Limitations](../README.md#22-limitations) — so this demo instead runs the
-real integration tests and benchmark runners that already spin up genuine
-multi-process behavior with real sockets, and shows you what to look for
-in their output. Total time: 3-5 minutes.
+checked while writing this document). Steps 1-12 run the real integration
+tests and benchmark runners that spin up genuine multi-process behavior
+with real sockets inside one JVM, and show you what to look for in their
+output; Step 13 is the real, standalone multi-process CLI launcher
+(`ClusterNodeMain` — see README §19) as actually separate `java`
+processes. Total time: 5-8 minutes including Step 13.
 
 Run everything from the repository root.
 
@@ -218,7 +218,7 @@ Each prints a full results table and writes a timestamped CSV to
 mvn clean test
 ```
 
-493 tests, 0 failures — every one of the behaviors above, plus unit-level
+495 tests, 0 failures — every one of the behaviors above, plus unit-level
 coverage of the WAL, SSTable format, MemTable, concurrency, protocol
 framing, and membership/failure-detection state machines, all in one run
 (roughly 2 minutes).
@@ -227,49 +227,84 @@ framing, and membership/failure-detection state machines, all in one run
 
 Post-Phase-15 audit addition: every step above runs through test/benchmark
 code that spins up real sockets and real objects, but still inside one
-JVM. This step is the same failover story as Steps 7-9, as three genuinely
-separate OS processes, driven only by a plain-text config file and a real
-client — the actual command sequence, actual output, run once while
-writing this document:
+JVM. This step is the same failover story as Steps 7-9, plus the rejoin
+resync story from Step 8's "old leader restarts" (10)-(13), as three
+genuinely separate OS processes, driven only by a plain-text config file
+and a real client — the actual command sequence, actual output, run once
+while writing this document (updated 2026-09-09 with the current 6-field
+config format and the `resync` subcommand added since the first version
+of this step):
 
 ```bash
 mvn -pl forge-cluster -am install -DskipTests
 
 cat > /tmp/forge-demo/cluster.conf <<'EOF'
-d1 localhost 18001 18002 18003
-d2 localhost 18011 18012 18013
-d3 localhost 18021 18022 18023
+# nodeId  host       raftPort  replicationPort  clientPort  snapshotPort
+n1        localhost  27001     27002            27003       27004
+n2        localhost  27011     27012            27013       27014
+n3        localhost  27021     27022            27023       27024
 EOF
 
-# one terminal each (or background processes, as done here):
-mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="/tmp/forge-demo/cluster.conf d1 /tmp/forge-demo/data-d1"
-mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="/tmp/forge-demo/cluster.conf d2 /tmp/forge-demo/data-d2"
-mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="/tmp/forge-demo/cluster.conf d3 /tmp/forge-demo/data-d3"
+# one terminal each (or background processes, as done here) —
+# forge-cluster's own pom.xml already defaults exec:java's mainClass to ClusterNodeMain:
+mvn -pl forge-cluster exec:java -Dexec.args="/tmp/forge-demo/cluster.conf n1 /tmp/forge-demo/data-n1"
+mvn -pl forge-cluster exec:java -Dexec.args="/tmp/forge-demo/cluster.conf n2 /tmp/forge-demo/data-n2"
+mvn -pl forge-cluster exec:java -Dexec.args="/tmp/forge-demo/cluster.conf n3 /tmp/forge-demo/data-n3"
 ```
 
-Each node's own log shows it coming up and finding the others:
+Each node's own log shows it coming up and finding the others; n3 won
+the election this run (term 1):
 ```
-INFO com.forge.cluster.launcher.ClusterNodeMain -- FORGE cluster node 'd2' up — client port 18013, raft port 18011, data directory /tmp/forge-demo/data-d2
-INFO com.forge.cluster.replication.ReplicationServer -- follower d3 connected, requesting catch-up from sequence 2000000000
-INFO com.forge.cluster.replication.ReplicationServer -- follower d1 connected, requesting catch-up from sequence 2000000000
+INFO ClusterNodeMain -- FORGE cluster node 'n3' up — client port 27023, raft port 27021, data directory /tmp/forge-demo/data-n3
+INFO ReplicationServer -- follower n1 connected, requesting catch-up from sequence 1000000000
+INFO ReplicationServer -- follower n2 connected, requesting catch-up from sequence 1000000000
 ```
-d2 won the election this run (term 2). A real client against the real
-leader succeeds; the same write against a real follower is rejected with
-the real protocol error, not silently accepted:
+A real client against the real leader succeeds; the same write against a
+real follower is rejected with the real protocol error, not silently
+accepted; reads reach every node via real replication:
 ```
-$ java ... Client put 18013 demo-key demo-value
-PUT OK
-$ java ... Client put 18003 demo-key should-fail
-Exception in thread "main" com.forge.client.ForgeServerException: NOT_LEADER term=2 leader=d2
-$ java ... Client get 18003 demo-key   # a FOLLOWER's own store — got there by real replication
-GET demo-key = demo-value
+$ java ... Client put 27023 alpha 1     # through n3, the leader
+PUT OK: alpha=1
+$ java ... Client put 27003 alpha fail  # against n1, a follower
+Exception in thread "main" com.forge.client.ForgeServerException: NOT_LEADER term=1 leader=n3
+$ java ... Client get 27003 alpha       # n1's OWN store — got there by real replication
+GET alpha = 1
 ```
-Killing d2's process outright (`kill -9`) produces a real election among
-the two survivors, logged the same way Step 7 showed inside one JVM:
+Killing n3's process outright (`kill -9`) produces a real election among
+the two survivors:
 ```
-INFO ReplicationFollowerCoordinator -- d3: stopping current replication follower (switching to leader d1 for term 3)
-INFO ReplicationFollowerCoordinator -- d3: now following leader d1 (term 3) from sequence 3000000000
+INFO ReplicationFollowerCoordinator -- n1: stopping current replication follower (switching to leader n2 for term 2)
+INFO ReplicationFollowerCoordinator -- n1: now following leader n2 (term 2) from sequence 2000000000
 ```
+Committed data survives, new writes and deletes work through the new
+leader n2, and n1 (a plain follower, gracefully `SIGTERM`'d and restarted
+with the same data directory) rejoins instantly with no resync needed —
+ordinary WAL replay is enough since its own persisted term already
+matched the cluster's. Restarting the crashed n3 is different: it
+**was** the old leader, so its `ReplicationFollowerCoordinator` correctly
+refuses to trust its own data:
+```
+$ mvn -pl forge-cluster exec:java -Dexec.args="/tmp/forge-demo/cluster.conf n3 /tmp/forge-demo/data-n3"
+...
+WARN ReplicationFollowerCoordinator -- n3: leader n2 is on term 2 but my own data implies term 1 — a full snapshot resync is needed before I can safely follow again; not attempting incremental catch-up
+```
+Stop it again, resync it against the real current leader (n2), then
+restart it normally — the exact `resync` subcommand from README §19:
+```
+$ kill -9 <n3's pid>
+$ mvn -pl forge-cluster exec:java -Dexec.args="resync /tmp/forge-demo/cluster.conf n3 /tmp/forge-demo/data-n3 n2"
+...
+INFO ClusterNodeMain -- resyncing 'n3' at /tmp/forge-demo/data-n3 from 'n2' (localhost:27014)
+INFO StaleReplicaRecovery -- wiped local data at /tmp/forge-demo/data-n3 ahead of a full snapshot resync from localhost:27014
+INFO StaleReplicaRecovery -- resync complete: /tmp/forge-demo/data-n3 now holds 3 keys
+INFO ClusterNodeMain -- resync of 'n3' complete — it can now be started normally
+$ mvn -pl forge-cluster exec:java -Dexec.args="/tmp/forge-demo/cluster.conf n3 /tmp/forge-demo/data-n3"
+...
+INFO ReplicationFollowerCoordinator -- n3: now following leader n2 (term 2) from sequence 2000000002   # no WARN this time
+```
+After this, `GET` against all three nodes for every key written before
+*and* after the crash returns identical, correct values — verified
+directly, not assumed.
 
 See [README §19](../README.md#19-how-to-run-a-multi-node-cluster--partitioning--replication--failover)
 for the full command reference and [ClusterNodeMain](../forge-cluster/src/main/java/com/forge/cluster/launcher/ClusterNodeMain.java)'s

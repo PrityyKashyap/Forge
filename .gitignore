@@ -1,6 +1,8 @@
 target/
 **/target/
 forge-data/
+*.wal
+raft-state
 *.class
 *.log
 .DS_Store

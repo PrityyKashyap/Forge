@@ -17,20 +17,24 @@ import java.util.Set;
  * docs/DEMO.md's own disclosed gap and README's Future Work). No new
  * dependency (JSON/YAML library) is introduced; this project hand-rolls
  * every wire format already, and a cluster's node list is small and static
- * enough that a five-field whitespace-separated line is entirely adequate.
+ * enough that a whitespace-separated line is entirely adequate.
  *
  * <h2>Format</h2>
- * One node per line: {@code nodeId host raftPort replicationPort clientPort}.
+ * One node per line:
+ * {@code nodeId host raftPort replicationPort clientPort snapshotPort}.
  * Blank lines and lines starting with {@code #} are ignored. Every node in
  * the cluster — including the one about to be started — must appear
  * exactly once; {@link ClusterNodeMain} finds its own entry by id and
- * treats every other line as a peer.
+ * treats every other line as a peer. {@code snapshotPort} backs the
+ * {@code resync} subcommand (every node runs a {@code SnapshotServer}
+ * unconditionally, so any node can act as a resync source for a stale
+ * peer rejoining the cluster).
  *
  * <pre>{@code
  * # a 3-node FORGE cluster, all on localhost
- * a  localhost  17001  17002  17003
- * b  localhost  17011  17012  17013
- * c  localhost  17021  17022  17023
+ * a  localhost  17001  17002  17003  17004
+ * b  localhost  17011  17012  17013  17014
+ * c  localhost  17021  17022  17023  17024
  * }</pre>
  */
 public final class ClusterConfig {
@@ -48,13 +52,14 @@ public final class ClusterConfig {
                 continue;
             }
             String[] parts = line.split("\\s+");
-            if (parts.length != 5) {
+            if (parts.length != 6) {
                 throw new IOException("malformed cluster config line in " + file
-                        + " (expected 'nodeId host raftPort replicationPort clientPort'): " + rawLine);
+                        + " (expected 'nodeId host raftPort replicationPort clientPort snapshotPort'): " + rawLine);
             }
             try {
                 specs.add(new NodeSpec(new NodeId(parts[0]), parts[1],
-                        Integer.parseInt(parts[2]), Integer.parseInt(parts[3]), Integer.parseInt(parts[4])));
+                        Integer.parseInt(parts[2]), Integer.parseInt(parts[3]), Integer.parseInt(parts[4]),
+                        Integer.parseInt(parts[5])));
             } catch (NumberFormatException e) {
                 throw new IOException("malformed port number in " + file + ": " + rawLine, e);
             }

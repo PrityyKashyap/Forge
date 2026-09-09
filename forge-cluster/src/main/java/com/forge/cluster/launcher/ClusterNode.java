@@ -5,6 +5,8 @@ import com.forge.cluster.NodeId;
 import com.forge.cluster.consensus.RaftCluster;
 import com.forge.cluster.leadership.PartitionLeadership;
 import com.forge.cluster.leadership.ReplicationFollowerCoordinator;
+import com.forge.cluster.recovery.SnapshotServer;
+import com.forge.cluster.recovery.StaleReplicaRecovery;
 import com.forge.cluster.replication.ReplicationServer;
 import com.forge.server.ForgeServer;
 import com.forge.storage.ConcurrentLsmKeyValueStore;
@@ -39,17 +41,21 @@ public final class ClusterNode implements Closeable {
     private static final Duration REPLICATION_ACK_INTERVAL = Duration.ofMillis(200);
     private static final Duration COORDINATOR_POLL_INTERVAL = Duration.ofMillis(200);
     private static final String PARTITION_ID = "p0";
+    private static final long FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024; // matches ConcurrentLsmKeyValueStore's own default
 
     private final ConcurrentLsmKeyValueStore store;
     private final ReplicationServer replicationServer;
+    private final SnapshotServer snapshotServer;
     private final RaftCluster raftCluster;
     private final ReplicationFollowerCoordinator coordinator;
     private final ForgeServer server;
 
     private ClusterNode(ConcurrentLsmKeyValueStore store, ReplicationServer replicationServer,
-            RaftCluster raftCluster, ReplicationFollowerCoordinator coordinator, ForgeServer server) {
+            SnapshotServer snapshotServer, RaftCluster raftCluster, ReplicationFollowerCoordinator coordinator,
+            ForgeServer server) {
         this.store = store;
         this.replicationServer = replicationServer;
+        this.snapshotServer = snapshotServer;
         this.raftCluster = raftCluster;
         this.coordinator = coordinator;
         this.server = server;
@@ -77,9 +83,10 @@ public final class ClusterNode implements Closeable {
             }
         }
 
-        ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dataDirectory);
+        ConcurrentLsmKeyValueStore store = new ConcurrentLsmKeyValueStore(dataDirectory, FLUSH_THRESHOLD_BYTES);
         try {
             ReplicationServer replicationServer = new ReplicationServer(store, self.replicationPort());
+            SnapshotServer snapshotServer = new SnapshotServer(store, self.snapshotPort());
             Path raftStateFile = dataDirectory.resolve("raft-state");
             RaftCluster raftCluster = new RaftCluster(selfId, raftPeerAddresses, self.raftPort(), Clock.systemUTC(),
                     ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX, HEARTBEAT_INTERVAL, TICK_INTERVAL, RPC_TIMEOUT,
@@ -88,11 +95,29 @@ public final class ClusterNode implements Closeable {
                     store, replicationAddresses, REPLICATION_ACK_INTERVAL, COORDINATOR_POLL_INTERVAL);
             PartitionLeadership leadership = new PartitionLeadership(PARTITION_ID, raftCluster, store);
             ForgeServer server = new ForgeServer(store, key -> true, leadership, self.clientPort());
-            return new ClusterNode(store, replicationServer, raftCluster, coordinator, server);
+            return new ClusterNode(store, replicationServer, snapshotServer, raftCluster, coordinator, server);
         } catch (IOException | RuntimeException e) {
             store.close();
             throw e;
         }
+    }
+
+    /**
+     * Offline resync tool, matching {@code forge-server}'s own {@code status}
+     * subcommand precedent: opens {@code dataDirectory} directly (must NOT be
+     * run against a directory a live {@link #start}ed node already has open —
+     * two processes cannot safely share one WAL/SSTable directory), wipes it,
+     * and reloads it completely from {@code sourceHost:sourceSnapshotPort}'s
+     * live {@link SnapshotServer}. See {@link StaleReplicaRecovery}'s class
+     * Javadoc for exactly when this is needed and what it guarantees.
+     */
+    public static void resync(Path dataDirectory, String sourceHost, int sourceSnapshotPort) throws IOException {
+        Objects.requireNonNull(dataDirectory, "dataDirectory must not be null");
+        Objects.requireNonNull(sourceHost, "sourceHost must not be null");
+        ConcurrentLsmKeyValueStore staleStore = new ConcurrentLsmKeyValueStore(dataDirectory, FLUSH_THRESHOLD_BYTES);
+        ConcurrentLsmKeyValueStore resynced = StaleReplicaRecovery.resyncFromSnapshot(
+                staleStore, dataDirectory, FLUSH_THRESHOLD_BYTES, sourceHost, sourceSnapshotPort);
+        resynced.close();
     }
 
     public int clientPort() {
@@ -117,6 +142,7 @@ public final class ClusterNode implements Closeable {
         closeQuietly(coordinator);
         closeQuietly(raftCluster);
         closeQuietly(replicationServer);
+        closeQuietly(snapshotServer);
         closeQuietly(store);
     }
 

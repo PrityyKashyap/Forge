@@ -35,6 +35,18 @@ import java.util.List;
  * independently, by hand or by a wrapping script.
  *
  * <p>Usage: {@code ClusterNodeMain <clusterConfigFile> <selfNodeId> <dataDirectory>}
+ *
+ * <h2>{@code resync} subcommand</h2>
+ * {@code ClusterNodeMain resync <clusterConfigFile> <selfNodeId> <dataDirectory> <sourceNodeId>}
+ * — the real, operator-facing answer to a
+ * {@code ReplicationFollowerCoordinator} log line like {@code "my own data
+ * implies term 1 but the leader is on term 2 — a full snapshot resync is
+ * needed"}: stop the stale node's process first (this, like {@code status},
+ * is an <b>offline</b> tool — it must never run against a directory a live
+ * node already has open), then run this against its data directory, then
+ * restart it normally. See {@link ClusterNode#resync} and {@link
+ * com.forge.cluster.recovery.StaleReplicaRecovery} for exactly what this
+ * does and guarantees.
  */
 public final class ClusterNodeMain {
 
@@ -44,8 +56,19 @@ public final class ClusterNodeMain {
     }
 
     public static void main(String[] args) throws IOException {
+        if (args.length > 0 && args[0].equals("resync")) {
+            if (args.length != 5) {
+                System.err.println("Usage: ClusterNodeMain resync <clusterConfigFile> <selfNodeId> <dataDirectory> <sourceNodeId>");
+                System.exit(1);
+                return;
+            }
+            runResync(Path.of(args[1]), new NodeId(args[2]), Path.of(args[3]), new NodeId(args[4]));
+            return;
+        }
+
         if (args.length != 3) {
             System.err.println("Usage: ClusterNodeMain <clusterConfigFile> <selfNodeId> <dataDirectory>");
+            System.err.println("       ClusterNodeMain resync <clusterConfigFile> <selfNodeId> <dataDirectory> <sourceNodeId>");
             System.exit(1);
             return;
         }
@@ -63,5 +86,15 @@ public final class ClusterNodeMain {
             log.info("shutting down node '{}'", selfId);
             node.close();
         }, "cluster-node-shutdown-" + selfId));
+    }
+
+    private static void runResync(Path configFile, NodeId selfId, Path dataDirectory, NodeId sourceId) throws IOException {
+        List<NodeSpec> specs = ClusterConfig.load(configFile);
+        NodeSpec source = specs.stream().filter(spec -> spec.id().equals(sourceId)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("source node id '" + sourceId + "' not found in cluster config " + configFile));
+        log.info("resyncing '{}' at {} from '{}' ({}:{})", selfId, dataDirectory.toAbsolutePath(), sourceId,
+                source.host(), source.snapshotPort());
+        ClusterNode.resync(dataDirectory, source.host(), source.snapshotPort());
+        log.info("resync of '{}' complete — it can now be started normally", selfId);
     }
 }

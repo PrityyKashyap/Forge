@@ -217,15 +217,32 @@ limitations).
 ### 3.14 Multi-node launcher (post-Phase-15 audit)
 `com.forge.cluster.launcher` (`ClusterConfig`/`NodeSpec`/`ClusterNode`/
 `ClusterNodeMain`) is a real CLI that starts one full cluster node — every
-component from §§3.1-3.13 wired together exactly as §3.13 describes —
-from a plain-text, one-line-per-node config file, as a genuine standalone
+component from §§3.1-3.13, plus a `SnapshotServer` (every node runs one
+unconditionally, exactly like `ReplicationServer`'s own precedent) — from
+a plain-text, one-line-per-node config file (`nodeId host raftPort
+replicationPort clientPort snapshotPort`), as a genuine standalone
 process. `ClusterNode.start(...)` holds the actual wiring (directly
 testable in-process, real ports, no subprocess needed); `ClusterNodeMain`
-is a thin CLI shell around it. Closes the "no way to run an N-node cluster
+is a thin CLI shell around it, plus a `resync` subcommand
+(`ClusterNodeMain resync <config> <selfId> <dataDirectory> <sourceNodeId>`)
+that runs `StaleReplicaRecovery` against an offline node's data directory
+— the real, operator-facing answer to a `ReplicationFollowerCoordinator`
+"needs a full resync" log line, matching `forge-server`'s own `status`
+subcommand precedent (an offline tool; never run against a directory a
+live node still has open). Closes the "no way to run an N-node cluster
 except from tests" gap named throughout Phase 15's own documentation — see
 PROGRESS.md's "Post-Phase-15 engineering audit" section and docs/DEMO.md
 Step 13. Single-partition scope, matching §3.13 exactly; no
 process-management of its own.
+
+Guarding this launcher's own packaging correctness (not just its wiring
+logic) is `ClusterNodeMainProcessSmokeTest`, the one test in this project
+that launches `ClusterNodeMain` via a real, separate `mvn exec:java`
+process rather than calling `ClusterNode.start` in-JVM — added after a
+real bug where `forge-cluster`'s `logback-classic` dependency was
+accidentally `test`-scoped, invisible to every in-JVM test (which runs on
+Surefire's broader test classpath) but silently missing from a genuine
+`mvn exec:java` launch.
 
 ## 4. Repository structure
 

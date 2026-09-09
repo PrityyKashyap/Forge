@@ -51,7 +51,28 @@
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
-            <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.5.0</version>
+                <configuration>
+                    <!-- The multi-node cluster launcher (see com.forge.cluster.launcher.ClusterNodeMain's
+                         own Javadoc). Run with:
+                         mvn -pl forge-cluster exec:java -Dexec.args="<clusterConfigFile> <selfNodeId> <dataDirectory>"
+                         Maven resolves the full runtime classpath, including this module's own
+                         logback-classic dependency below (compile scope, matching forge-server's
+                         identical declaration; it must not be test-scoped, since ClusterNodeMain is
+                         a real runtime entry point, not test code). Never construct this classpath
+                         by hand with a manual java -cp command. -->
+                    <mainClass>com.forge.cluster.launcher.ClusterNodeMain</mainClass>
+                    <classpathScope>compile</classpathScope>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

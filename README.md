@@ -7,7 +7,7 @@ engineering audit** (partitioning, membership/failure detection,
 replication, recovery, chaos testing, distributed benchmarking,
 compaction/Bloom filters, Raft consensus, Raft-driven data-plane failover
 with stale-leader fencing, durable Raft term/vote state, and a real
-multi-process cluster launcher) — 493/493 tests passing. See
+multi-process cluster launcher) — 495/495 tests passing. See
 [PROGRESS.md](PROGRESS.md) for the full phase-by-phase log, including real
 bugs found and fixed along the way, and this README's
 [Limitations](#22-limitations) section for what's honestly not done yet.
@@ -251,14 +251,24 @@ repository — never estimated. Highlights (full detail and methodology in
 
 ## 17. How to build and test
 
-Requires Java 21+ and Maven.
+Requires Java 21 or newer and Maven 3.9+. The build targets Java 21
+bytecode (`maven.compiler.release=21` in the root `pom.xml`) — actually
+built and run, including every test in this section, on **OpenJDK 26**
+(Homebrew) during this project's own verification; nothing here depends
+on anything newer than the Java 21 language level.
 
 ```bash
+export JAVA_HOME=/path/to/your/jdk   # must be Java 21+
+export PATH="$JAVA_HOME/bin:$PATH"
+
 mvn clean install    # builds all 7 modules, runs all tests
 ```
 
-493 tests across `forge-common`, `forge-storage`, `forge-server`,
-`forge-client`, `forge-cluster`, `forge-bench`, and `tests` (0 failures).
+**495 tests, 0 failures, 0 errors** across `forge-common`, `forge-storage`,
+`forge-server`, `forge-client`, `forge-cluster`, `forge-bench`, and
+`tests` — verified with this exact command on 2026-09-09. `forge-tests`'
+own `[WARNING] JAR will be empty` is expected and harmless: that module is
+intentionally test-only and never meant to be depended on as a library.
 
 ## 18. How to run a single node
 
@@ -267,6 +277,12 @@ mvn -pl forge-server -am install -DskipTests
 mvn -pl forge-server exec:java -Dexec.args="<dataDirectory> <port>"
 # both arguments optional — defaults to ./forge-data and port 7070
 ```
+
+Always start FORGE this way (via Maven's `exec:java`), never with a
+hand-built `java -cp ...` command — Maven resolves the full runtime
+classpath (SLF4J/Logback included) automatically; a manually constructed
+classpath that omits them fails immediately with
+`NoClassDefFoundError: org/slf4j/LoggerFactory`.
 
 Then, from your own code or a REPL, talk to it with `ForgeClient`:
 
@@ -294,16 +310,17 @@ a genuine standalone process — no test harness involved:
 mvn -pl forge-cluster -am install -DskipTests
 
 cat > cluster.conf <<'EOF'
-# nodeId  host       raftPort  replicationPort  clientPort
-a         localhost  17001     17002            17003
-b         localhost  17011     17012            17013
-c         localhost  17021     17022            17023
+# nodeId  host       raftPort  replicationPort  clientPort  snapshotPort
+a         localhost  17001     17002            17003       17004
+b         localhost  17011     17012            17013       17014
+c         localhost  17021     17022            17023       17024
 EOF
 
-# run once per line, in three separate terminals (or as three background processes):
-mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="cluster.conf a /tmp/forge-a"
-mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="cluster.conf b /tmp/forge-b"
-mvn -pl forge-cluster exec:java -Dexec.mainClass=com.forge.cluster.launcher.ClusterNodeMain -Dexec.args="cluster.conf c /tmp/forge-c"
+# run once per line, in three separate terminals (or as three background processes) —
+# forge-cluster's own pom.xml already defaults exec:java's mainClass to ClusterNodeMain:
+mvn -pl forge-cluster exec:java -Dexec.args="cluster.conf a /tmp/forge-a"
+mvn -pl forge-cluster exec:java -Dexec.args="cluster.conf b /tmp/forge-b"
+mvn -pl forge-cluster exec:java -Dexec.args="cluster.conf c /tmp/forge-c"
 ```
 
 Three real OS processes elect a leader, accept writes only through it
@@ -313,6 +330,22 @@ see [docs/DEMO.md](docs/DEMO.md#step-13-the-real-multi-process-launcher)
 for a full walkthrough with real output. Scope: single-partition (id
 `"p0"`), matching `PartitionLeadership`'s current scope — every listed
 node is a replica of that one partition.
+
+**Recovering a node whose data may have diverged** (see §15/§22 — a
+node that crashed while leader and comes back with data implying an
+older term than the cluster's current one): its
+`ReplicationFollowerCoordinator` logs a clear `WARN` refusing to guess,
+rather than silently risking stale data. Fix it with the `resync`
+subcommand (stop the affected node first — like `status`, this is an
+**offline** tool that must never run against a directory a live node
+still has open):
+
+```bash
+# <sourceNodeId> is any healthy node from the same cluster.conf (its snapshotPort is used):
+mvn -pl forge-cluster exec:java -Dexec.args="resync cluster.conf a /tmp/forge-a b"
+# then restart it normally:
+mvn -pl forge-cluster exec:java -Dexec.args="cluster.conf a /tmp/forge-a"
+```
 
 Everything below remains true and is still how each individual mechanism
 is proven in isolation, each spinning up genuine separate
@@ -397,8 +430,11 @@ and [docs/CONSISTENCY.md](docs/CONSISTENCY.md) for full detail:
   the ordinary follower path. See `RaftPersistentState`'s Javadoc for the
   full reasoning and `RaftClusterPersistenceIntegrationTest` for the proof.
 - **Full resync on rejoin is detected but not auto-performed** — a
-  caller must explicitly invoke `StaleReplicaRecovery`; see
-  [PROGRESS.md](PROGRESS.md)'s Phase 15 known limitations for why.
+  node flags the need clearly (a `WARN` log line) but never resyncs
+  itself. An operator runs it explicitly via `ClusterNodeMain resync`
+  (§19) or `StaleReplicaRecovery` directly; see
+  [PROGRESS.md](PROGRESS.md)'s Phase 15 known limitations for why
+  automatic resync isn't attempted.
 - **No authentication, authorization, or transport encryption** — every
   TCP connection is trusted.
 - **The multi-node CLI launcher (§19) has no process-management or

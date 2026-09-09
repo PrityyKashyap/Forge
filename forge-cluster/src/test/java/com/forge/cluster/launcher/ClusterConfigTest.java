@@ -20,27 +20,27 @@ class ClusterConfigTest {
         Files.writeString(file, """
                 # a comment line, and a blank line below should both be ignored
 
-                a  localhost  17001  17002  17003
-                b  localhost  17011  17012  17013
+                a  localhost  17001  17002  17003  17004
+                b  localhost  17011  17012  17013  17014
                 """);
 
         List<NodeSpec> specs = ClusterConfig.load(file);
         assertEquals(2, specs.size());
-        assertEquals(new NodeSpec(new NodeId("a"), "localhost", 17001, 17002, 17003), specs.get(0));
-        assertEquals(new NodeSpec(new NodeId("b"), "localhost", 17011, 17012, 17013), specs.get(1));
+        assertEquals(new NodeSpec(new NodeId("a"), "localhost", 17001, 17002, 17003, 17004), specs.get(0));
+        assertEquals(new NodeSpec(new NodeId("b"), "localhost", 17011, 17012, 17013, 17014), specs.get(1));
     }
 
     @Test
     void rejectsAMissingField(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("cluster.conf");
-        Files.writeString(file, "a localhost 17001 17002\n");
+        Files.writeString(file, "a localhost 17001 17002 17003\n");
         assertThrows(IOException.class, () -> ClusterConfig.load(file));
     }
 
     @Test
     void rejectsANonNumericPort(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("cluster.conf");
-        Files.writeString(file, "a localhost not-a-port 17002 17003\n");
+        Files.writeString(file, "a localhost not-a-port 17002 17003 17004\n");
         assertThrows(IOException.class, () -> ClusterConfig.load(file));
     }
 
@@ -48,8 +48,8 @@ class ClusterConfigTest {
     void rejectsADuplicateNodeId(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("cluster.conf");
         Files.writeString(file, """
-                a localhost 17001 17002 17003
-                a localhost 17011 17012 17013
+                a localhost 17001 17002 17003 17004
+                a localhost 17011 17012 17013 17014
                 """);
         assertThrows(IOException.class, () -> ClusterConfig.load(file));
     }
