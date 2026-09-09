@@ -152,6 +152,16 @@ public final class FaultInjectingTcpProxy implements Closeable {
         }
         activeSockets.add(client);
         activeSockets.add(target);
+        // partition() severs whatever is in activeSockets at the moment it runs. A connection
+        // that was accepted before the partition but only reached the two adds above after it
+        // would otherwise be missed entirely -- left alive, pumping into a partitioned proxy,
+        // which is exactly the "silently open but permanently dead" state this class's contract
+        // promises never to produce. Re-checking here (after registering, so partition() can no
+        // longer miss this connection either) closes that window from the other side.
+        if (partitioned) {
+            severConnection(client, target);
+            return;
+        }
         try {
             Thread forward = Thread.ofPlatform().start(() -> pump(client, target));
             Thread backward = Thread.ofPlatform().start(() -> pump(target, client));
@@ -178,7 +188,14 @@ public final class FaultInjectingTcpProxy implements Closeable {
                     return; // clean EOF; let the caller close both sockets
                 }
                 if (partitioned) {
-                    continue; // drop silently; the connection is about to be closed anyway
+                    // The connection must actually DIE here, not merely stop forwarding: looping
+                    // back into a blocking read leaves this proxy holding a socket that is open
+                    // yet permanently silent, so the peer blocks until its own read timeout (or
+                    // forever, if it has none) instead of seeing the connection drop. Closing both
+                    // ends also unblocks the sibling pump immediately, so handleConnection's joins
+                    // return and its cleanup actually runs.
+                    severConnection(from, to);
+                    return;
                 }
                 if (dropCount.getAndUpdate(c -> c > 0 ? c - 1 : 0) > 0) {
                     continue; // this chunk is the fault: genuinely never forwarded
@@ -225,6 +242,19 @@ public final class FaultInjectingTcpProxy implements Closeable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Drops both ends of one proxied connection, unregistering them first so
+     * a concurrent {@link #partition()} sweep cannot race with the close.
+     * {@link Socket#close()} is idempotent, so it is harmless for this to run
+     * alongside {@code partition()} or {@code handleConnection}'s own cleanup.
+     */
+    private void severConnection(Socket client, Socket target) {
+        activeSockets.remove(client);
+        activeSockets.remove(target);
+        closeQuietly(client);
+        closeQuietly(target);
     }
 
     private static void closeQuietly(Socket socket) {
